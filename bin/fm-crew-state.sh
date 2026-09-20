@@ -201,6 +201,16 @@ meta_value() {  # <key>
   grep "^$1=" "$META" 2>/dev/null | tail -1 | cut -d= -f2- || true
 }
 
+if [ "$(meta_value backend)" = vercel ]; then
+  case "$(meta_value delivery_state)" in
+    completed) emit "done" vercel "PR $(meta_value pr)" ;;
+    running|initializing|allocating) emit working vercel "remote worker; watcher owns provider observations" ;;
+    failed|missing|interrupted) emit failed vercel "$(meta_value failure)" ;;
+    cancelled) emit paused vercel "cancelled" ;;
+    *) emit unknown vercel ;;
+  esac
+fi
+
 WT=$(meta_value worktree)
 KIND=$(meta_value kind)
 HARNESS=$(meta_value harness)

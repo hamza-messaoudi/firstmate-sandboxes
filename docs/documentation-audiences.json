@@ -473,6 +473,14 @@
       "audience": "maintainer-verification"
     },
     {
+      "path": "plans/vercel-herdr-setup.md",
+      "audience": "maintainer-architecture"
+    },
+    {
+      "path": "docs/vercel-backend.md",
+      "audience": "operator-current"
+    },
+    {
       "path": "docs/verification/runtime-backends.md",
       "audience": "maintainer-verification"
     },

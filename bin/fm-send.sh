@@ -371,6 +371,10 @@ fm_send_resolve_target() { # <raw-target>
       return 1
     fi
     backend=$(fm_backend_of_meta "$meta")
+    if [ "$backend" = vercel ]; then
+      echo 'error: Vercel has no durable steering inbox; use direct interactive attachment' >&2
+      return 1
+    fi
     RESOLVED_TARGET=$target
     TARGET_BACKEND=$backend
     TARGET_META=$meta
