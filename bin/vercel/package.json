@@ -1,0 +1,7 @@
+{
+  "name": "firstmate-vercel-execution",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "dependencies": { "@vercel/sandbox": "3.3.0" }
+}
