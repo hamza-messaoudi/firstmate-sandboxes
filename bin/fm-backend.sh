@@ -67,8 +67,8 @@ FM_BACKEND_CONFIG_DIR="${FM_CONFIG_OVERRIDE:-$FM_HOME/config}"
 # cmux is EXPERIMENTAL and spawn-capable, session-provider-only like
 # herdr/zellij - verified against the real 0.64.17 binary (docs/cmux-backend.md).
 # codex-app remains deliberately absent; see docs/codex-app-backend.md.
-FM_BACKEND_KNOWN="tmux herdr zellij orca cmux"
-FM_BACKEND_SPAWN="tmux herdr zellij orca cmux"
+FM_BACKEND_KNOWN="tmux herdr zellij orca cmux vercel"
+FM_BACKEND_SPAWN="tmux herdr zellij orca cmux vercel"
 
 # fm_backend_list_contains: whitespace-delimited membership without relying on
 # shell word splitting. fm-backend.sh is normally sourced by bash scripts, but
@@ -312,6 +312,7 @@ fm_backend_required_tools() {  # <backend>
     zellij) printf '%s' 'zellij jq treehouse' ;;
     cmux)   printf '%s' 'cmux jq treehouse' ;;
     orca)   printf '%s' 'orca' ;;
+    vercel) printf '%s' 'node jq' ;;
     *) return 1 ;;
   esac
 }
@@ -417,6 +418,16 @@ fm_backend_validate_task_endpoint() {  # <meta-file> <task-id>
     echo "REFUSED: task endpoint identity has an invalid task id; preserving task state." >&2
     return 1
   esac
+  if [ "$(fm_meta_get "$meta" backend)" = vercel ]; then
+    [ "$(fm_backend_meta_exact_value "$meta" task_id)" = "$id" ] || return 1
+    [ "$(fm_backend_meta_exact_value "$meta" endpoint_task_id)" = "$id" ] || return 1
+    window=$(fm_backend_meta_exact_value "$meta" window) || return 1
+    { [ "$window" = "$meta" ] || [ "$window" = "$(cd "${meta%/*}" && pwd -P)/${meta##*/}" ]; } || return 1
+    [ -z "$(fm_meta_get "$meta" worktree)" ] || return 1
+    FM_BACKEND_VALIDATED_BACKEND=vercel
+    FM_BACKEND_VALIDATED_TARGET=$meta
+    return 0
+  fi
   window=$(fm_backend_meta_exact_value "$meta" window) || {
     echo "REFUSED: task $id has a missing, empty, or ambiguous window endpoint; preserving task state." >&2
     return 1
@@ -617,6 +628,7 @@ fm_backend_source() {  # <name>
   local name=$1
   fm_backend_validate "$name" || return 1
   case "$name" in
+    vercel) return 0 ;;
     tmux)
       if [ -z "${_FM_BACKEND_TMUX_SOURCED:-}" ]; then
         # shellcheck source=/dev/null
@@ -718,6 +730,12 @@ fm_backend_capture() {  # <backend> <target> <lines> [expected-label]
   shift
   fm_backend_source "$backend" || return 1
   case "$backend" in
+    vercel)
+      # Generic supervision reads saved evidence only; the SDK watcher owns probes.
+      if [ -f "$1.evidence" ]; then
+        fm_meta_get "$1.evidence" terminal_tail | jq -r .
+      fi
+      ;;
     tmux) fm_backend_tmux_capture "$@" ;;
     herdr) fm_backend_herdr_capture "$@" ;;
     zellij) fm_backend_zellij_capture "$@" ;;
@@ -894,6 +912,7 @@ fm_backend_composer_state() {  # <backend> <target> [expected-label] -> empty|pe
 fm_backend_target_exists() {  # <backend> <target> [expected-label]
   local backend=$1 target=$2 expected_label=${3:-} session pane
   case "$backend" in
+    vercel) [ "$(fm_meta_get "$target" delivery_state)" = running ]; return ;;
     tmux)
       tmux display-message -p -t "$target" '#{pane_id}' >/dev/null 2>&1
       ;;

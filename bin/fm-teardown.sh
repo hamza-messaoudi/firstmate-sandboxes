@@ -349,7 +349,7 @@ if [ -f "$META" ] && [ ! -L "$META" ]; then
   TEARDOWN_LOCK_WT=$(fm_meta_get "$META" worktree)
   TEARDOWN_LOCK_PROJECT=$(fm_meta_get "$META" project)
   if [ "$TEARDOWN_LOCK_KIND" != secondmate ] \
-     && [ "$TEARDOWN_LOCK_BACKEND" != orca ] \
+     && [ "$TEARDOWN_LOCK_BACKEND" != orca ] && [ "$TEARDOWN_LOCK_BACKEND" != vercel ] \
      && fm_treehouse_pool_slot "$TEARDOWN_LOCK_PROJECT" "$TEARDOWN_LOCK_WT"; then
     TREEHOUSE_SLOT_LOCK_REQUIRED=1
     TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$TEARDOWN_LOCK_PROJECT") || {
@@ -424,6 +424,18 @@ fm_backlog_record_present "$META" "task record" "$STATE" || {
   echo "error: teardown refused: $FM_BACKLOG_TRANSITION_ERROR" >&2
   exit 1
 }
+if [ "$(fm_meta_get "$META" backend)" = vercel ]; then
+  # Read-only delivery refusal precedes cancellation. --force is existing discard authority.
+  if [ "$FORCE" != --force ]; then
+    "$SCRIPT_DIR/backends/vercel.sh" --backend vercel landed "$META" >/dev/null || {
+      echo 'error: remote work is not verified merged; retain it or obtain explicit discard authority' >&2
+      exit 1
+    }
+  fi
+  # shellcheck source=bin/fm-vercel-lifecycle.sh
+  . "$SCRIPT_DIR/fm-vercel-lifecycle.sh"
+  fm_vercel_quiesce "$META" || exit 1
+fi
 META_LOCK=$(fm_meta_lock_path "$META") || exit 1
 fm_lock_acquire_wait "$META_LOCK"
 META_LOCK_HELD=1
@@ -993,7 +1005,7 @@ CLEANUP_RECOVERY=$TEARDOWN_CLEANUP_RECOVERY
 
 KIND=$TEARDOWN_META_KIND
 EXPECTED_TREEHOUSE_PROJECT_LOCK=
-if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] \
+if [ "$KIND" != secondmate ] && [ "$BACKEND" != orca ] && [ "$BACKEND" != vercel ] \
    && fm_treehouse_pool_slot "$PROJ" "$WT"; then
   EXPECTED_TREEHOUSE_PROJECT_LOCK=$(fm_treehouse_project_lock_path "$PROJ") || {
     echo "REFUSED: cannot resolve the shared Treehouse project lock for ${PROJ:-<missing>}; nothing was changed" >&2
@@ -2296,6 +2308,7 @@ require_owned_task_worktree_slot() {
 }
 
 teardown_owns_worktree() {
+  [ "$BACKEND" != vercel ] || return 1
   [ "$TEARDOWN_SLOT_REASSIGNED" != 1 ]
 }
 
@@ -3304,6 +3317,20 @@ if [ "$BACKEND" = herdr ]; then
   TEARDOWN_HERDR_PANE=$FM_BACKEND_HERDR_PANE
 fi
 
+if [ "$BACKEND" = vercel ]; then
+  # The normal teardown already holds the meta lock. The helper writes the
+  # same record atomically; quiesce above proved there is no competing watcher.
+  node "$SCRIPT_DIR/vercel/fm-vercel.mjs" delete "$META" >/dev/null || {
+    echo 'error: Vercel cleanup unresolved; retaining identity and evidence' >&2
+    exit 1
+  }
+  mkdir -p "$DATA/$ID"
+  cp "$META" "$DATA/$ID/vercel-final.meta" || exit 1
+  if [ -f "$META.evidence" ]; then
+    cp "$META.evidence" "$DATA/$ID/vercel-evidence" || exit 1
+  fi
+fi
+
 BACKLOG_CLOSED=0
 BACKLOG_TRANSITION=$TEARDOWN_BACKLOG_TRANSITION
 BACKLOG_TRANSITION_FLAGS=()
@@ -3497,6 +3524,8 @@ elif [ "$BACKEND" = herdr ]; then
   else
     echo "warning: herdr session presentation lock path is unavailable; skipping the pane close rather than closing unlocked" >&2
   fi
+elif [ "$BACKEND" = vercel ]; then
+  : # Cloud deletion and evidence archival completed before backlog-close publication.
 elif [ "$BACKEND" != orca ]; then
   fm_backend_kill "$BACKEND" "$T" "$(meta_value "$META" zellij_tab_id)" "fm-$ID" \
     || endpoint_close_refusal "$ID" "$BACKEND" "$T" 1 || exit 1

@@ -70,7 +70,7 @@ async function fixture(options = {}) {
     sleep: async ms => { now += ms; if (options.onSleep) await options.onSleep(path); },
     fetcher: async (url, request) => {
       calls.push(['github', url, request]);
-      return { ok: !options.githubFails, json: async () => url.includes('/commits/') ? { sha } : { default_branch: 'main' } };
+      return { ok: !options.githubFails, json: async () => url.includes('/pulls/') ? options.pr : url.includes('/commits/') ? { sha } : { default_branch: 'main' } };
     },
   });
   return { path, dir, calls, execution, session, options, get sandbox() { return sandbox; },
@@ -318,3 +318,185 @@ test('installed optional SDK does not replay ambiguous fork requests', async t =
     assert.equal(calls, 1);
   }
 });
+
+function resultValue(record) {
+  return { version: 1, task_id: record.task_id, run_id: record.run_id, kind: 'direct-PR',
+    branch: record.branch, head_sha: sha, pr_url: 'https://github.com/owner/repo/pull/123' };
+}
+function prValue(record) {
+  return { html_url: 'https://github.com/owner/repo/pull/123', state: 'open',
+    head: { repo: { full_name: record.repository }, ref: record.branch, sha },
+    base: { repo: { full_name: record.repository }, ref: record.base_branch } };
+}
+test('result verifies GitHub before completion; marker wins over absent tmux', () => using({}, async f => {
+  const record = await f.spawn();
+  f.options.stdout = 'result\n' + JSON.stringify(resultValue(record));
+  f.options.pr = prValue(record);
+  assert.equal((await f.execution.result(record)).state, 'completed');
+  assert.ok(f.calls.some(([kind, url]) => kind === 'github' && url.endsWith('/pulls/123')));
+}));
+for (const key of ['run_id', 'task_id', 'branch', 'head_sha', 'pr_url']) {
+  test(`rejects mismatched result ${key}`, () => using({}, async f => {
+    const record = await f.spawn();
+    f.options.stdout = 'result\n' + JSON.stringify({ ...resultValue(record), [key]: 'wrong' });
+    f.options.pr = prValue(record);
+    assert.equal((await f.execution.result(record)).state, 'failed');
+  }));
+}
+for (const key of ['repository', 'branch', 'sha', 'base']) {
+  test(`rejects GitHub ${key} mismatch`, () => using({}, async f => {
+    const record = await f.spawn();
+    f.options.stdout = 'result\n' + JSON.stringify(resultValue(record));
+    f.options.pr = prValue(record);
+    if (key === 'repository') f.options.pr.head.repo.full_name = 'other/repo';
+    if (key === 'branch') f.options.pr.head.ref = 'other';
+    if (key === 'sha') f.options.pr.head.sha = 'c'.repeat(40);
+    if (key === 'base') f.options.pr.base.ref = 'other';
+    assert.equal((await f.execution.result(record)).state, 'failed');
+  }));
+}
+test('transient GitHub failure is unknown and oversized result fails closed', () => using({}, async f => {
+  const record = await f.spawn();
+  f.options.stdout = 'result\n' + JSON.stringify(resultValue(record));
+  f.options.githubFails = true;
+  assert.equal((await f.execution.result(record)).state, 'unknown');
+  f.options.stdout = 'result\n' + 'x'.repeat(4097);
+  assert.equal((await f.execution.result(record)).state, 'failed');
+}));
+test('reconciliation preserves evidence and PR despite stop failure; event replay is exactly once', () => using({ stopFails: true }, async f => {
+  const record = await f.spawn();
+  f.options.stdout = 'result\n' + JSON.stringify(resultValue(record));
+  f.options.pr = prValue(record);
+  const notify = async (meta, line) => execFileSync('bash', ['bin/fm-vercel-event.sh', f.path, meta.run_id, line]);
+  await f.execution.reconcile(f.path, notify, 1000);
+  let saved = await readRecord(f.path);
+  assert.equal(saved.delivery_state, 'completed');
+  assert.equal(saved.cleanup_state, 'unresolved');
+  assert.equal(saved.pr, resultValue(record).pr_url);
+  assert.ok((await readRecord(f.path + '.evidence')).result);
+  f.calls.length = 0;
+  f.options.stopFails = false;
+  await f.execution.reconcile(f.path, notify, 1000);
+  assert.equal(f.calls.filter(([kind]) => kind === 'command').length, 0);
+  assert.equal((await readFile(f.path.replace('.meta', '.status'), 'utf8')).trim().split('\n').length, 1);
+  saved = await readRecord(f.path);
+  assert.equal(saved.cleanup_state, 'stopped');
+  await assert.rejects(f.execution.landed(saved));
+  f.options.pr.merged = true;
+  assert.deepEqual(await f.execution.landed(saved), { landed: true });
+  await f.execution.cleanup(f.path, 'delete');
+  assert.equal((await readRecord(f.path)).delivery_state, 'completed');
+}));
+test('cancel marker halts reconciliation before any provider request', () => using({}, async f => {
+  await f.spawn();
+  await writeFile(f.path + '.cancel', '');
+  f.calls.length = 0;
+  await f.execution.reconcile(f.path, () => assert.fail('notification after cancellation'), 1000);
+  assert.equal(f.calls.length, 0);
+}));
+test('remote task metadata has no local worktree and crew-state does not probe local Git', () => using({}, async f => {
+  const record = await f.spawn();
+  assert.equal(record.worktree, '');
+  assert.equal(record.endpoint_task_id, record.task_id);
+  assert.equal(record.window, f.path);
+  const output = execFileSync('bash', ['bin/fm-crew-state.sh', 'task'], {
+    env: { ...process.env, FM_STATE_OVERRIDE: f.dir }, encoding: 'utf8' });
+  assert.match(output, /state: working.*source: vercel/);
+}));
+test('backend registration is explicit and remote endpoint validation refuses local worktree', () => using({}, async f => {
+  const record = await f.spawn();
+  const invoke = () => spawnSync('bash', ['-c', '. bin/fm-backend.sh; fm_backend_validate_spawn vercel && fm_backend_validate_task_endpoint "$1" test', '_', f.path], { encoding: 'utf8' });
+  assert.equal(invoke().status, 0);
+  await saveRecord(f.path, { ...record, worktree: '/vercel/sandbox/repo' });
+  assert.notEqual(invoke().status, 0);
+}));
+
+test('spawn entrypoint refuses unsupported modes before provider or worktree allocation', () => using({}, async f => {
+  const { mkdir } = await import('node:fs/promises');
+  const home = join(f.dir, 'home');
+  await mkdir(join(home, 'state'), { recursive: true });
+  await mkdir(join(home, 'data'), { recursive: true });
+  await mkdir(join(home, 'config'), { recursive: true });
+  for (const args of [ ['--scout'], ['--mode', 'local-only', '--yolo', 'off'],
+    ['--mode', 'direct-PR', '--yolo', 'on'], ['--secondmate'] ]) {
+    const output = spawnSync('bash', ['bin/fm-spawn.sh', 'remote-test', f.dir, '--backend', 'vercel', '--harness', 'codex', ...args], {
+      env: { ...process.env, FM_HOME: home, FM_ROOT_OVERRIDE: process.cwd() }, encoding: 'utf8' });
+    assert.notEqual(output.status, 0, output.stdout + output.stderr);
+    assert.match(output.stderr, /Vercel.*(supports only|does not support)/);
+    await assert.rejects(readFile(join(home, 'state', 'remote-test.meta')), { code: 'ENOENT' });
+  }
+}));
+test('single watcher lock refuses a competing watcher before SDK loading', () => using({}, async f => {
+  await f.spawn();
+  const { mkdir } = await import('node:fs/promises');
+  const lock = f.path + '.watch.lock';
+  await mkdir(lock);
+  await writeFile(join(lock, 'pid'), String(process.pid) + '\n');
+  const output = spawnSync('bash', ['bin/backends/vercel.sh', '--backend', 'vercel', 'reconcile', f.path], { encoding: 'utf8' });
+  assert.notEqual(output.status, 0);
+  assert.match(output.stderr, /record busy/);
+  assert.equal((await readFile(join(lock, 'pid'), 'utf8')).trim(), String(process.pid));
+}));
+
+test('spawn and teardown entrypoints retain cleanup identity on failure, avoid local worktrees', () => using({}, async f => {
+  const { mkdir } = await import('node:fs/promises');
+  const home = join(f.dir, 'home');
+  const bin = join(f.dir, 'bin');
+  for (const directory of [bin, join(home, 'state'), join(home, 'data/test'), join(home, 'config')]) await mkdir(directory, { recursive: true });
+  await writeFile(join(home, 'config/backlog-backend'), 'manual\n');
+  await writeFile(join(home, 'config/vercel.json'), JSON.stringify(config));
+  await writeFile(join(home, 'data/test/brief.md'), '# Task\n## Captain\'s intent\nMake a harmless change.\n## Firstmate spec\nTest it.\n# Setup\nLOCAL SCAFFOLD MUST NOT TRAVEL\nDelivery contract: mode=direct-PR\n');
+  const project = join(f.dir, 'project');
+  await mkdir(project);
+  execFileSync('git', ['init', '-q', project]);
+  execFileSync('git', ['-C', project, 'remote', 'add', 'origin', config.origin]);
+  const mock = join(f.dir, 'mock.mjs');
+  const helperURL = new URL('../bin/vercel/fm-vercel.mjs', import.meta.url).href;
+  await writeFile(mock, `import {readFile,appendFile} from 'node:fs/promises';
+import {saveRecord,readRecord} from ${JSON.stringify(helperURL)};
+const [op,path,...args]=process.argv.slice(2);
+await appendFile(process.env.TEST_LOG,op+'\\n');
+if(op==='spawn') {
+const c=JSON.parse(await readFile(args[0],'utf8'));
+const brief=await readFile(args[1],'utf8');
+if(brief.includes('LOCAL SCAFFOLD')) throw Error('host scaffold leaked');
+await saveRecord(path,{backend:'vercel',task_id:c.task_id,endpoint_task_id:c.task_id,window:path,worktree:'',project:c.local_project,kind:'ship',mode:'direct-PR',yolo:'off',harness:'codex',spawn_gen:'s123.4.5',run_id:'run',delivery_state:'running',cleanup_state:'pending'});
+} else if(op==='reconcile') {
+const r=await readRecord(path); await saveRecord(path,{...r,watcher_pid:process.pid});
+} else if(op==='delete') {
+if(process.env.TEST_DELETE_FAIL==='1') process.exit(1);
+const r=await readRecord(path); await saveRecord(path,{...r,delivery_state:'cancelled',cleanup_state:'deleted'});
+} else if(op==='landed') process.exit(1);
+`);
+  await writeFile(join(bin, 'node'), `#!/bin/bash\nif [[ "$1" == */vercel/fm-vercel.mjs ]]; then shift; exec ${quote(process.execPath)} ${quote(mock)} "$@"; fi\nexec ${quote(process.execPath)} "$@"\n`, { mode: 0o700 });
+  for (const tool of ['treehouse', 'tmux']) await writeFile(join(bin, tool), '#!/bin/sh\necho LOCAL_ALLOCATION >> "$TEST_LOG"\nexit 99\n', { mode: 0o700 });
+  const log = join(f.dir, 'calls');
+  const testEnv = { ...process.env, FM_HOME: home, FM_ROOT_OVERRIDE: process.cwd(), FM_TEARDOWN_GUARD_DONE: '1', PATH: `${bin}:${process.env.PATH}`, TEST_LOG: log };
+  const spawned = spawnSync('bash', ['bin/fm-spawn.sh', 'test', project, '--backend', 'vercel', '--harness', 'codex', '--mode', 'direct-PR', '--yolo', 'off'], { env: testEnv, encoding: 'utf8' });
+  assert.equal(spawned.status, 0, spawned.stdout + spawned.stderr);
+  const meta = join(home, 'state/test.meta');
+  assert.equal((await readRecord(meta)).worktree, '');
+  const refused = spawnSync('bash', ['bin/fm-teardown.sh', 'test'], { env: testEnv, encoding: 'utf8' });
+  assert.notEqual(refused.status, 0);
+  assert.match(refused.stderr, /not verified merged/);
+  const failed = spawnSync('bash', ['bin/fm-teardown.sh', 'test', '--force'], { env: { ...testEnv, TEST_DELETE_FAIL: '1' }, encoding: 'utf8' });
+  assert.notEqual(failed.status, 0);
+  assert.match(failed.stderr, /cleanup unresolved/);
+  assert.ok(await readRecord(meta));
+  await assert.rejects(readFile(join(home, 'state/test.backlog-close')), { code: 'ENOENT' });
+  const removed = spawnSync('bash', ['bin/fm-teardown.sh', 'test', '--force'], { env: testEnv, encoding: 'utf8' });
+  assert.equal(removed.status, 0, removed.stdout + removed.stderr);
+  await assert.rejects(readFile(meta), { code: 'ENOENT' });
+  assert.equal((await readRecord(join(home, 'data/test/vercel-final.meta'))).cleanup_state, 'deleted');
+  assert.ok(!(await readFile(log, 'utf8')).includes('LOCAL_ALLOCATION'));
+}));
+
+test('watcher update uses normal metadata serialization and preserves unrelated fields', () => using({}, async f => {
+  const record = await f.spawn();
+  await saveRecord(f.path, { ...record, unrelated: 'preserve' });
+  const update = (patch) => spawnSync('bash', ['bin/backends/vercel.sh', '--backend', 'vercel', 'update', f.path], { input: JSON.stringify(patch), encoding: 'utf8' });
+  assert.equal(update({ ...record, delivery_state: 'completed', unrelated: 'overwrite' }).status, 0);
+  assert.equal((await readRecord(f.path)).unrelated, 'preserve');
+  assert.equal((await readRecord(f.path)).delivery_state, 'completed');
+  assert.notEqual(update({ ...record, run_id: 'wrong' }).status, 0);
+}));

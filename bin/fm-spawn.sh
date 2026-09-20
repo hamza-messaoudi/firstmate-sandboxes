@@ -1415,6 +1415,10 @@ spawn_require_relocated_queued_work() {
     exit 1
   fi
 }
+if [ "$RELAUNCH" -eq 1 ] && [ "$(fm_meta_get "$STATE/$ID.meta" backend)" = vercel ]; then
+  echo 'error: Vercel relaunch is unsupported; stop or tear down the recorded worker explicitly' >&2
+  exit 1
+fi
 if [ "$RELAUNCH" -eq 1 ]; then
   SPAWN_CONTROL_LOCK="$STATE/.control-$ID.lock"
   control_owner=$(cat "$SPAWN_CONTROL_LOCK/pid" 2>/dev/null || true)
@@ -1469,6 +1473,10 @@ if [ "$RELAUNCH" -eq 0 ]; then
   spawn_refuse_if_away_spend_cap
   spawn_require_relocated_queued_work
 fi
+if [ "$KIND" = secondmate ] && { [ "$BACKEND_ARG" = vercel ] || { [ "$BACKEND_SET" = 0 ] && [ "$(fm_backend_name)" = vercel ]; }; }; then
+  echo 'error: Vercel does not support secondmates' >&2
+  exit 1
+fi
 if [ "$KIND" = secondmate ]; then
   if spawn_remote_secondmate "$ID"; then
     exit 0
@@ -1510,6 +1518,12 @@ if ! fm_lock_try_acquire "$SPAWN_TASK_LOCK"; then
   exit 1
 fi
 SPAWN_TASK_LOCK_HELD=1
+if [ "$BACKEND" = vercel ] && [ "$RELAUNCH" = 0 ]; then
+  # shellcheck source=bin/fm-vercel-lifecycle.sh
+  . "$SCRIPT_DIR/fm-vercel-lifecycle.sh"
+  fm_vercel_spawn
+  exit $?
+fi
 PROJ=
 ARG3=
 FIRSTMATE_HOME=

@@ -2,6 +2,9 @@
 // Explicit Vercel execution primitives. SDK and credentials remain backend-local.
 // CLI is entered through ../backends/vercel.sh, which owns record serialization.
 import { readFile, writeFile, rename, unlink } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 
@@ -22,7 +25,9 @@ export async function readRecord(path) {
   for (const line of (await readFile(path, 'utf8')).trim().split('\n')) {
     const at = line.indexOf('=');
     if (at < 1) throw new Error('invalid record');
-    record[line.slice(0, at)] = line.slice(at + 1);
+    const key = line.slice(0, at);
+    if (!/^[a-z_]+$/.test(key) || Object.hasOwn(record, key)) throw new Error('ambiguous record');
+    record[key] = line.slice(at + 1);
   }
   return record;
 }
@@ -95,7 +100,7 @@ export function singleAttemptFetch(fetcher) {
 }
 
 export function createExecution({ sdk, env = process.env, fetcher = fetch, providerFetch = fetch, clock = Date.now,
-  uuid = randomUUID, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
+  uuid = randomUUID, persist = saveRecord, sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) }) {
   const transport = singleAttemptFetch(providerFetch);
   const credentials = record => {
     requireThat(env.VERCEL_TOKEN, 'VERCEL_TOKEN environment credential required');
@@ -168,8 +173,10 @@ export function createExecution({ sdk, env = process.env, fetcher = fetch, provi
       base_snapshot: snapshot_id, repository: config.repository, base_branch, base_sha,
       branch: `fm/${config.task_id}-${run_id}`, harness: config.harness, tmux_session: `fm-${run_id}`,
       remote_repo: REPO_PATH, remote_run_dir: `/vercel/sandbox/firstmate/${run_id}`,
+      spawn_gen: `s${clock()}.${process.pid}.${run_id}`, kind: 'ship', mode: 'direct-PR', yolo: 'off', endpoint_task_id: config.task_id,
+      project: config.local_project || '', worktree: '', window: path,
       deadline: clock() + config.timeout_ms, delivery_state: 'allocating', cleanup_state: 'pending' };
-    await saveRecord(path, record);
+    await persist(path, record);
     try {
       let sandbox;
       try {
@@ -184,7 +191,7 @@ export function createExecution({ sdk, env = process.env, fetcher = fetch, provi
       identity(record, sandbox);
       record.session_id = sandbox.currentSession()?.sessionId || '';
       record.delivery_state = 'initializing';
-      await saveRecord(path, record);
+      await persist(path, record);
       requireThat(sandbox.sourceSnapshotId === snapshot_id, 'fork did not use validated base snapshot');
       requireThat(record.session_id && sandbox.status === 'running', 'fork has no running session');
       // Verify actual worker binaries before repository setup. The stopped base is never executed.
@@ -222,14 +229,14 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
         `sh ${quote(record.remote_run_dir + '/launch.sh')}`]);
       await command(record, 'tmux', ['has-session', '-t', `=${record.tmux_session}`]);
       record.delivery_state = 'running';
-      await saveRecord(path, record);
+      await persist(path, record);
       return record;
     } catch {
       record.delivery_state = 'failed';
       record.failure = 'spawn failed; inspect cleanup state';
       try { await stopAllocated(record); record.cleanup_state = 'stopped'; }
       catch { record.cleanup_state = 'unresolved'; }
-      await saveRecord(path, record);
+      await persist(path, record);
       throw new Error('spawn failed; cleanup identity retained');
     }
   }
@@ -266,9 +273,9 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
     const record = await readRecord(path);
     // Cancellation is durable before provider IO. Existing watchers reread this record.
     identity(record, { name: record.sandbox_name, tags: { fm_run: record.run_id, fm_task: record.task_id } });
-    record.delivery_state = 'cancelled';
+    if (record.delivery_state !== 'completed') record.delivery_state = 'cancelled';
     record.cleanup_state = 'pending';
-    await saveRecord(path, record);
+    await persist(path, record);
     try {
       const sandbox = await worker(record);
       if (operation === 'stop') await sandbox.stop({ signal: signal() });
@@ -277,13 +284,14 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
     } catch (error) {
       record.cleanup_state = missing(error) ? 'absent' : 'unresolved';
     }
-    await saveRecord(path, record);
+    await persist(path, record);
     requireThat(record.cleanup_state !== 'unresolved', 'cleanup unresolved; record retained for retry');
     return record;
   }
   async function watch(path, emit, interval = 10000) {
     requireThat(Number.isInteger(interval) && interval >= 1000 && interval <= 60000, 'watch interval must be 1000..60000');
     while (true) {
+      try { await readFile(path + '.cancel'); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
       const record = await readRecord(path);
       const observation = await inspect(record);
       emit(observation);
@@ -292,14 +300,125 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
       await sleep(Math.min(interval, Math.max(0, Number(record.deadline) - clock())));
     }
   }
-  return { preflight, spawn, inspect, capture, send, submit, cleanup, watch };
+  // A single bounded probe checks the marker first. Session-bound commands
+  // cannot resume a stopped sandbox between inspection and execution.
+  async function result(record) {
+    const observation = await inspect(record);
+    if (observation.state !== 'running') return observation;
+    try {
+      const output = await command(record, 'sh', ['-ceu',
+        `if test -f ${quote(record.remote_run_dir + '/done')}; then printf 'result\\n'; head -c 4097 ${quote(record.remote_run_dir + '/result.json')}; elif tmux has-session -t ${quote('=' + record.tmux_session)} 2>/dev/null; then printf 'running'; else printf 'failed'; fi`]);
+      const text = await output.stdout();
+      if (text === 'running' || text === 'failed') return { state: text };
+      if (!text.startsWith('result\n') || Buffer.byteLength(text.slice(7)) > 4096) return { state: 'failed', reason: 'invalid result envelope' };
+      let value;
+      try { value = JSON.parse(text.slice(7)); } catch { return { state: 'failed', reason: 'invalid result' }; }
+      if (!value || value.version !== 1 || value.task_id !== record.task_id || value.run_id !== record.run_id ||
+          value.kind !== 'direct-PR' || value.branch !== record.branch || !/^[a-f0-9]{40}$/.test(value.head_sha)) {
+        return { state: 'failed', reason: 'result identity mismatch' };
+      }
+      const prefix = `https://github.com/${record.repository}/pull/`;
+      if (typeof value.pr_url !== 'string' || !value.pr_url.startsWith(prefix) ||
+          !/^[1-9][0-9]*$/.test(value.pr_url.slice(prefix.length))) return { state: 'failed', reason: 'invalid PR URL' };
+      let pr;
+      try { pr = await github(`${record.repository}/pulls/${value.pr_url.slice(prefix.length)}`); }
+      catch { return { state: 'unknown' }; }
+      if (pr.html_url !== value.pr_url || pr.base?.repo?.full_name !== record.repository ||
+          pr.head?.repo?.full_name !== record.repository || pr.head?.ref !== record.branch ||
+          pr.head?.sha !== value.head_sha || pr.base?.ref !== record.base_branch || pr.state !== 'open') {
+        return { state: 'failed', reason: 'GitHub PR identity mismatch' };
+      }
+      return { state: 'completed', result: value };
+    } catch { return { state: 'unknown' }; }
+  }
+  // Delivery and cleanup are independent: stopping must never erase a PR.
+  async function stopCompleted(path) {
+    const record = await readRecord(path);
+    requireThat(record.delivery_state === 'completed', 'completion required');
+    try { await stopAllocated(record); record.cleanup_state = 'stopped'; }
+    catch (error) { record.cleanup_state = missing(error) ? 'absent' : 'unresolved'; }
+    await persist(path, record);
+    return record;
+  }
+  async function landed(record) {
+    requireThat(record.delivery_state === 'completed' && record.pr && record.head_sha, 'verified completion required');
+    const prefix = `https://github.com/${record.repository}/pull/`;
+    requireThat(record.pr.startsWith(prefix) && /^[1-9][0-9]*$/.test(record.pr.slice(prefix.length)), 'invalid PR');
+    const pr = await github(`${record.repository}/pulls/${record.pr.slice(prefix.length)}`);
+    requireThat(pr.merged === true && pr.base?.repo?.full_name === record.repository &&
+      pr.base?.ref === record.base_branch && pr.head?.ref === record.branch &&
+      pr.head?.repo?.full_name === record.repository && pr.head?.sha === record.head_sha, 'remote work is not verified landed');
+    return { landed: true };
+  }
+  async function reconcile(path, notify, interval = 10000) {
+    requireThat(Number.isInteger(interval) && interval >= 1000 && interval <= 60000, 'invalid poll interval');
+    try { await readFile(path + '.cancel'); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+    const initial = await readRecord(path);
+    await persist(path, { ...initial, watcher_pid: process.pid });
+    let backoff = interval;
+    while (true) {
+      let record = await readRecord(path);
+      try { await readFile(path + '.cancel'); return; } catch (error) { if (error.code !== 'ENOENT') throw error; }
+      if (record.delivery_state === 'completed') {
+        await notify(record, `done: PR ${record.pr} [run=${record.run_id}]`);
+        await stopCompleted(path);
+        return;
+      }
+      if (['failed', 'missing', 'interrupted'].includes(record.delivery_state)) {
+        await notify(record, `failed: Vercel ${record.failure} [run=${record.run_id}]`);
+        return;
+      }
+      if (!['running', 'initializing', 'allocating'].includes(record.delivery_state)) return;
+      const observation = await result(record);
+      if (observation.state === 'completed') {
+        // Evidence precedes the status event. A crash can replay notification safely.
+        let tail = '';
+        try { tail = await capture(record); } catch { /* completion remains valid */ }
+        await persist(path + '.evidence', { result: JSON.stringify(observation.result), terminal_tail: JSON.stringify(tail) });
+        record = { ...record, delivery_state: 'completed', pr: observation.result.pr_url, head_sha: observation.result.head_sha };
+        await persist(path, record);
+        continue;
+      }
+      if (['failed', 'missing', 'interrupted'].includes(observation.state) || Number(record.deadline) <= clock()) {
+        record.delivery_state = observation.state === 'unknown' ? 'interrupted' : observation.state;
+        record.failure = observation.reason || 'worker interrupted or completion contract missing';
+        await persist(path, record);
+        await notify(record, `failed: Vercel ${record.failure} [run=${record.run_id}]`);
+        return;
+      }
+      backoff = observation.state === 'unknown' ? Math.min(backoff * 2, 60000) : interval;
+      await sleep(Math.min(backoff, Math.max(0, Number(record.deadline) - clock())));
+    }
+  }
+  return { preflight, spawn, inspect, capture, send, submit, cleanup, watch, result, stopCompleted, reconcile, landed };
 }
 
 async function main() {
   const [operation, path, ...args] = process.argv.slice(2);
-  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'submit', 'watch', 'stop', 'delete'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
+  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'submit', 'watch', 'stop', 'delete', 'reconcile', 'landed', 'update'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
+  // update is local-only and entered under the ordinary metadata lock.
+  if (operation === 'update') {
+    let input = '';
+    for await (const chunk of process.stdin) {
+      input += chunk.toString('utf8');
+      requireThat(Buffer.byteLength(input) <= 16384, 'update too large');
+    }
+    const patch = JSON.parse(input);
+    const current = await readRecord(path);
+    requireThat(current.backend === 'vercel' && current.run_id === patch.run_id, 'stale watcher');
+    for (const key of ['watcher_pid', 'delivery_state', 'cleanup_state', 'pr', 'head_sha', 'failure']) {
+      if (Object.hasOwn(patch, key)) current[key] = patch[key];
+    }
+    await saveRecord(path, current);
+    return;
+  }
   const sdk = await import('@vercel/sandbox');
-  const execution = createExecution({ sdk });
+  const persist = operation !== 'reconcile' ? saveRecord : async (target, record) => {
+    if (target !== path) return saveRecord(target, record);
+    execFileSync(join(dirname(fileURLToPath(import.meta.url)), '../backends/vercel.sh'),
+      ['--backend', 'vercel', 'update', path], { input: JSON.stringify(record), stdio: ['pipe', 'ignore', 'pipe'] });
+  };
+  const execution = createExecution({ sdk, persist });
   const json = result => process.stdout.write(JSON.stringify(result) + '\n');
   if (operation === 'doctor') {
     const result = await execution.preflight(JSON.parse(await readFile(path, 'utf8')));
@@ -309,7 +428,10 @@ async function main() {
     const result = await execution.spawn(path, JSON.parse(await readFile(args[0], 'utf8')), await readFile(args[1], 'utf8'));
     process.stderr.write('Worker starts from remote committed code; local changes are not included.\n');
     json(result);
-  } else if (operation === 'watch') await execution.watch(path, json, args[0] === undefined ? 10000 : Number(args[0]));
+  } else if (operation === 'reconcile') await execution.reconcile(path, async (record, line) => {
+    execFileSync(join(dirname(fileURLToPath(import.meta.url)), '../fm-vercel-event.sh'), [path, record.run_id, line], { stdio: ['ignore', 'ignore', 'pipe'] });
+  });
+  else if (operation === 'watch') await execution.watch(path, json, args[0] === undefined ? 10000 : Number(args[0]));
   else if (operation === 'stop' || operation === 'delete') json(await execution.cleanup(path, operation));
   else {
     const record = await readRecord(path);
