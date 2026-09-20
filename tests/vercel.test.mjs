@@ -258,6 +258,19 @@ test('adapter rejects implicit backend before loading provider SDK', () => {
   assert.match(result.stderr, /usage:/);
 });
 
+test('doctor names a missing credential without echoing provider errors', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fmv-'));
+  const config = join(dir, 'c.json');
+  await writeFile(config, JSON.stringify({ backend: 'vercel', mode: 'ship', delivery: 'direct-PR', harness: 'codex', task_id: 't',
+    base_name: 'b', team_id: 'team_x', project_id: 'prj_x', origin: 'https://github.com/o/r', git_author_name: 'a',
+    git_author_email: 'a@b.c', timeout_ms: 60000 }));
+  const env = { ...process.env }; delete env.VERCEL_TOKEN; delete env.GH_TOKEN;
+  const result = spawnSync('bash', ['bin/backends/vercel.sh', '--backend', 'vercel', 'doctor', config], { encoding: 'utf8', env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /VERCEL_TOKEN and GH_TOKEN environment credentials required/);
+  await rm(dir, { recursive: true });
+});
+
 test('completion helper publishes a bounded structured result then marker; rejects wrong branch/URL', () => using({}, async f => {
   const bin = join(f.dir, 'fakebin');
   const { mkdir } = await import('node:fs/promises');

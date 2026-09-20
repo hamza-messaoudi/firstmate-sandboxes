@@ -38,7 +38,8 @@ const OUTPUT_BYTES = 32768;
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(value);
 const signal = () => AbortSignal.timeout(REQUEST_MS);
 const missing = error => error?.status === 404 || error?.statusCode === 404 || error?.response?.status === 404;
-function requireThat(condition, message) { if (!condition) throw new Error(message); }
+class ConfigError extends Error {}
+function requireThat(condition, message) { if (!condition) throw new ConfigError(message); }
 function safeText(value) { return typeof value === 'string' && value.length > 0 && !/[\r\n\0]/.test(value); }
 
 export function configuration(config, env) {
@@ -447,8 +448,9 @@ async function main() {
   }
 }
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => {
-    // SDK/remote errors may contain request headers, tokens, command output, or URLs.
+  main().catch(error => {
+    // SDK/remote errors may contain request headers, tokens, command output, or URLs; only our own validation messages are shown.
+    if (error instanceof ConfigError) process.stderr.write(`Vercel validation failed: ${error.message}\n`);
     process.stderr.write('Vercel operation failed. Check configuration, credentials, and retained cleanup record.\n');
     process.exitCode = 1;
   });
