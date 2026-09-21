@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, readFile, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { saveRecord, readRecord, quote } from '../bin/vercel/fm-vercel.mjs';
@@ -258,18 +258,35 @@ test('adapter rejects implicit backend before loading provider SDK', () => {
   assert.match(result.stderr, /usage:/);
 });
 
-test('doctor names a missing credential without echoing provider errors', async () => {
-  const dir = await mkdtemp(join(tmpdir(), 'fmv-'));
-  const config = join(dir, 'c.json');
-  await writeFile(config, JSON.stringify({ backend: 'vercel', mode: 'ship', delivery: 'direct-PR', harness: 'codex', task_id: 't',
-    base_name: 'b', team_id: 'team_x', project_id: 'prj_x', origin: 'https://github.com/o/r', git_author_name: 'a',
-    git_author_email: 'a@b.c', timeout_ms: 60000 }));
-  const env = { ...process.env }; delete env.VERCEL_TOKEN; delete env.GH_TOKEN;
-  const result = spawnSync('bash', ['bin/backends/vercel.sh', '--backend', 'vercel', 'doctor', config], { encoding: 'utf8', env });
-  assert.equal(result.status, 1);
-  assert.match(result.stderr, /VERCEL_TOKEN and GH_TOKEN environment credentials required/);
-  await rm(dir, { recursive: true });
-});
+for (const operation of ['doctor', 'spawn']) {
+  test(`${operation} validates missing credentials without the optional SDK`, async () => {
+    const dir = await realpath(await mkdtemp(join(tmpdir(), 'fmv-')));
+    try {
+      // A standalone CLI copy has no adjacent optional SDK, even on SDK-enabled hosts.
+      const helper = join(dir, 'fm-vercel.mjs');
+      await writeFile(helper, await readFile(new URL('../bin/vercel/fm-vercel.mjs', import.meta.url)));
+      const configPath = join(dir, 'config.json');
+      const recordPath = join(dir, 'task.meta');
+      await writeFile(configPath, JSON.stringify(config));
+      const testEnv = { ...process.env };
+      delete testEnv.VERCEL_TOKEN;
+      delete testEnv.GH_TOKEN;
+      const args = operation === 'doctor' ? [configPath] : [recordPath, configPath, join(dir, 'unused-brief')];
+      const result = spawnSync(process.execPath, [helper, operation, ...args], { encoding: 'utf8', env: testEnv });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, /VERCEL_TOKEN and GH_TOKEN environment credentials required/);
+      assert.equal(result.stdout, '');
+      await assert.rejects(readFile(recordPath), { code: 'ENOENT' });
+      // Valid local input still hides SDK-loading/provider error details.
+      const providerFailure = spawnSync(process.execPath, [helper, operation, ...args], {
+        encoding: 'utf8', env: { ...testEnv, ...env },
+      });
+      assert.equal(providerFailure.status, 1);
+      assert.equal(providerFailure.stderr,
+        'Vercel operation failed. Check configuration, credentials, and retained cleanup record.\n');
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+}
 
 test('completion helper publishes a bounded structured result then marker; rejects wrong branch/URL', () => using({}, async f => {
   const bin = join(f.dir, 'fakebin');
