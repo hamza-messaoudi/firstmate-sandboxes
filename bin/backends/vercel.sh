@@ -10,6 +10,7 @@
 # Tool and interactive Codex login preparation remain operator responsibilities.
 # spawn accepts task content only, not a local Firstmate launch brief/inbox contract.
 # spawn: record is a NEW private .meta path; arguments: config.json task.md.
+# attach: interactive terminal viewer; session-bound, never resumes or extends timeout.
 # inspect|capture|send|submit|watch|stop|delete: record is the spawn .meta path.
 # capture accepts a line count (1..200); send reads literal UTF-8 text on stdin.
 # watch accepts interval milliseconds (1000..60000) and polls without reconciliation.
@@ -29,14 +30,14 @@ set -eu
 
 VERCEL_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 if [ "${1:-}" != --backend ] || [ "${2:-}" != vercel ] || [ "$#" -lt 4 ]; then
-  echo 'usage: vercel.sh --backend vercel <doctor|spawn|inspect|capture|send|submit|watch|stop|delete> <record> [arguments]' >&2
+  echo 'usage: vercel.sh --backend vercel <doctor|spawn|inspect|capture|send|submit|watch|stop|delete|attach> <record> [arguments]' >&2
   exit 2
 fi
 shift 2
 VERCEL_OP=$1
 VERCEL_RECORD=$2
 shift 2
-case "$VERCEL_OP" in doctor|spawn|inspect|capture|send|submit|watch|stop|delete|reconcile|landed|update) ;; *) exit 2 ;; esac
+case "$VERCEL_OP" in doctor|spawn|inspect|capture|send|submit|watch|stop|delete|reconcile|landed|update|attach) ;; *) exit 2 ;; esac
 VERCEL_PARENT=$(cd "$(dirname "$VERCEL_RECORD")" && pwd -P)
 VERCEL_RECORD="$VERCEL_PARENT/$(basename "$VERCEL_RECORD")"
 # Scope the lock library's directory initialization to this explicit record.
@@ -82,7 +83,7 @@ fi
 # cannot leave an unowned polling child. The portable lock reclaims its stale
 # directory after exit; no PID-based watcher kill is needed.
 case "$VERCEL_OP" in
-  watch|reconcile) exec node "$VERCEL_BIN/vercel/fm-vercel.mjs" "$VERCEL_OP" "$VERCEL_RECORD" "$@" ;;
+  watch|reconcile|attach) exec node "$VERCEL_BIN/vercel/fm-vercel.mjs" "$VERCEL_OP" "$VERCEL_RECORD" "$@" ;;
 esac
 # Explicit stdin redirection preserves piped literal input for the background child.
 node "$VERCEL_BIN/vercel/fm-vercel.mjs" "$VERCEL_OP" "$VERCEL_RECORD" "$@" <&0 &

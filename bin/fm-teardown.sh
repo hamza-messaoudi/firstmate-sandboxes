@@ -3324,6 +3324,7 @@ if [ "$BACKEND" = vercel ]; then
     echo 'error: Vercel cleanup unresolved; retaining identity and evidence' >&2
     exit 1
   }
+  "$SCRIPT_DIR/fm-vercel-view.sh" disconnect "$META" >/dev/null 2>&1 || true
   mkdir -p "$DATA/$ID"
   cp "$META" "$DATA/$ID/vercel-final.meta" || exit 1
   if [ -f "$META.evidence" ]; then

@@ -530,3 +530,135 @@ test('watcher update uses normal metadata serialization and preserves unrelated 
   assert.equal((await readRecord(f.path)).delivery_state, 'completed');
   assert.notEqual(update({ ...record, run_id: 'wrong' }).status, 0);
 }));
+
+test('attach opens only the recorded running Session; disconnect has no lifecycle effect', () => using({}, async f => {
+  const record = await f.spawn();
+  let opens = 0;
+  f.session.openInteractive = async ({ signal }) => { assert.ok(signal); opens++; return { url: 'wss://example.test', token: 'private' }; };
+  assert.equal((await f.execution.attach(record)).url, 'wss://example.test');
+  assert.equal(opens, 1);
+  assert.equal(f.calls.filter(([kind]) => kind === 'stop' || kind === 'delete').length, 0);
+  f.sandbox.status = 'stopped';
+  await assert.rejects(f.execution.attach(record), /not running/);
+  f.sandbox.status = 'running';
+  f.session.sessionId = 'changed';
+  await assert.rejects(f.execution.attach(record), /session changed/);
+  assert.equal(opens, 1);
+  const calls = f.calls.length;
+  for (const delivery_state of ['completed', 'cancelled', 'failed', 'initializing']) {
+    await assert.rejects(f.execution.attach({ ...record, delivery_state }), /not running/);
+  }
+  assert.equal(f.calls.length, calls);
+  await f.execution.cleanup(f.path, 'delete');
+  await assert.rejects(f.execution.attach(record));
+  assert.equal(opens, 1);
+}));
+
+import { EventEmitter } from 'node:events';
+import { interactive } from '../bin/vercel/viewer.mjs';
+test('viewer starts exact tmux attach, forwards bytes and resize, restores terminal on close', async () => {
+  const sent = [], written = [];
+  const input = new EventEmitter();
+  Object.assign(input, { isRaw: false, setRawMode(value) { this.isRaw = value; }, resume() {}, pause() {} });
+  const output = { columns: 100, rows: 30, write: data => written.push(data) };
+  const signals = new EventEmitter();
+  class Socket extends EventTarget {
+    readyState = 1;
+    constructor(url) { super(); assert.equal(url.searchParams.get('token'), 'secret'); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
+    send(data) {
+      sent.push(data);
+      if (typeof data === 'string' && JSON.parse(data).type === 'start') queueMicrotask(() => {
+        input.emit('data', Buffer.from('hello'));
+        signals.emit('SIGWINCH');
+        this.dispatchEvent(new MessageEvent('message', { data: new Uint8Array([65]).buffer }));
+        this.close();
+      });
+    }
+    close() { if (this.readyState === 3) return; this.readyState = 3; this.dispatchEvent(new Event('close')); }
+  }
+  await interactive({ url: 'wss://example.test', token: 'secret' }, { tmux_session: 'exact', remote_repo: '/vercel/sandbox/repo' }, { Socket, input, output, signals });
+  assert.deepEqual(JSON.parse(sent[0]).args, ['attach-session', '-t', '=exact']);
+  assert.equal(sent[1].toString(), 'hello');
+  assert.equal(JSON.parse(sent[2]).type, 'resize');
+  assert.equal(written[0].toString(), 'A');
+  assert.equal(input.isRaw, false);
+  assert.equal(input.listenerCount('data'), 0);
+  assert.equal(signals.listenerCount('SIGTERM'), 0);
+});
+
+test('Herdr viewer persists exact identifiers; closure and creation failure leave worker state alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fm-vercel-view-'));
+  const root = new URL('../', import.meta.url).pathname;
+  const path = join(dir, 'task.meta'), log = join(dir, 'calls');
+  const realNode = process.execPath;
+  try {
+    await writeFile(join(dir, 'node'), `#!/bin/sh\nif [ "$2" = inspect ]; then printf '%s\\n' '{"state":"running"}'; exit 0; fi\nexec ${quote(realNode)} "$@"\n`, { mode: 0o755 });
+    await writeFile(join(dir, 'herdr'), `#!${realNode}
+const fs = require('fs');
+const args = process.argv.slice(2);
+fs.appendFileSync(process.env.VIEW_LOG, JSON.stringify(args) + '\\n');
+if (args.at(-2) !== '--session' || args.at(-1) !== 'fm-lab-mocked-view') process.exit(9);
+const op = args.slice(0, 2).join(' ');
+if (op === 'workspace list') console.log(JSON.stringify({result:{workspaces:[{workspace_id:'w-exact',label:'firstmate'}]}}));
+else if (op === 'tab create') { if (process.env.VIEW_FAIL) process.exit(1); console.log(JSON.stringify({result:{tab:{tab_id:'t-exact'},root_pane:{pane_id:'w-exact:p-exact'}}})); }
+else if (op === 'pane get') console.log(JSON.stringify({result:{pane:{pane_id:'w-exact:p-exact',tab_id:'t-exact',workspace_id:process.env.VIEW_WRONG ? 'wrong' : 'w-exact'}}}));
+else if (!['pane run','pane close'].includes(op)) process.exit(8);
+`, { mode: 0o755 });
+    const environment = { ...process.env, PATH: `${dir}:${process.env.PATH}`, HERDR_SESSION: 'fm-lab-mocked-view', VIEW_LOG: log, FM_HOME: dir };
+    for (const key of ['HERDR_ENV','HERDR_PANE_ID','HERDR_TAB_ID','HERDR_WORKSPACE_ID','HERDR_SOCKET_PATH']) delete environment[key];
+    const call = (op, extra = {}) => spawnSync('bash', [join(root, 'bin/fm-vercel-view.sh'), op, path], { env: { ...environment, ...extra }, encoding: 'utf8' });
+    const initial = { backend: 'vercel', task_id: 'test', run_id: run, delivery_state: 'running', watcher_pid: '987', cleanup_state: 'none' };
+    await saveRecord(path, initial);
+    const command = call('command');
+    assert.equal(command.status, 0, command.stderr);
+    assert.match(command.stdout, /--backend vercel attach/);
+    const created = call('create');
+    assert.equal(created.status, 0, created.stderr);
+    const recorded = await readRecord(path);
+    assert.equal(recorded.viewer_session, 'fm-lab-mocked-view');
+    assert.equal(recorded.viewer_workspace, 'w-exact');
+    assert.equal(recorded.viewer_tab, 't-exact');
+    assert.equal(recorded.viewer_pane, 'w-exact:p-exact');
+    assert.notEqual(call('create').status, 0);
+    assert.notEqual(call('disconnect', { VIEW_WRONG: '1' }).status, 0);
+    const closed = call('disconnect');
+    assert.equal(closed.status, 0, closed.stderr);
+    assert.deepEqual(await readRecord(path), recorded);
+    await assert.rejects(stat(path + '.cancel'), { code: 'ENOENT' });
+    const calls = (await readFile(log, 'utf8')).trim().split('\n').map(JSON.parse);
+    assert.equal(calls.filter(args => args[0] === 'tab' && args[1] === 'create').length, 1);
+    assert.equal(calls.filter(args => args[0] === 'pane' && args[1] === 'close').length, 1);
+    assert.equal(calls.find(args => args[1] === 'run')[2], 'w-exact:p-exact');
+    assert.match(calls.find(args => args[1] === 'run')[3], /--backend vercel attach/);
+    await saveRecord(path, initial);
+    assert.notEqual(call('create', { VIEW_FAIL: '1' }).status, 0);
+    assert.deepEqual(await readRecord(path), initial);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('stop racing attach fails on the same session without resume or retry', () => using({}, async f => {
+  const record = await f.spawn();
+  let opens = 0;
+  f.session.openInteractive = async () => { opens++; f.sandbox.status = 'stopped'; throw Error('session stopped'); };
+  const before = f.calls.length;
+  await assert.rejects(f.execution.attach(record), /session stopped/);
+  assert.equal(opens, 1);
+  assert.deepEqual(f.calls.slice(before).map(([kind]) => kind), ['get']);
+  assert.equal(f.sandbox.status, 'stopped');
+}));
+
+test('viewer reports remote attachment failure and restores terminal', async () => {
+  const input = new EventEmitter();
+  Object.assign(input, { isRaw: false, setRawMode(value) { this.isRaw = value; }, resume() {}, pause() {} });
+  class Socket extends EventTarget {
+    readyState = 1;
+    constructor() { super(); queueMicrotask(() => this.dispatchEvent(new Event('open'))); }
+    send() { queueMicrotask(() => this.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ type: 'exit', code: 1 }) }))); }
+    close() { if (this.readyState === 3) return; this.readyState = 3; this.dispatchEvent(new Event('close')); }
+  }
+  await assert.rejects(interactive({ url: 'wss://example.test', token: 'secret' }, { tmux_session: 'gone' }, {
+    Socket, input, output: { write() {} }, signals: new EventEmitter(),
+  }), /remote tmux attachment failed/);
+  assert.equal(input.isRaw, false);
+  assert.equal(input.listenerCount('data'), 0);
+});

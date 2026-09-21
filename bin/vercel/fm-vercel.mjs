@@ -158,6 +158,13 @@ export function createExecution({ sdk, env = process.env, fetcher = fetch, provi
     requireThat(result.exitCode === 0, 'remote command failed');
     return result;
   }
+  async function attach(record) {
+    requireThat(record.delivery_state === 'running', 'task is not running');
+    requireThat(validId(record.tmux_session), 'invalid tmux identity');
+    const current = await session(record);
+    // Unlike Sandbox.openInteractive, Session.openInteractive never resumes.
+    return current.openInteractive({ signal: signal() });
+  }
   async function stopAllocated(record) {
     const sandbox = await worker(record);
     await sandbox.stop({ signal: signal() });
@@ -391,12 +398,12 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
       await sleep(Math.min(backoff, Math.max(0, Number(record.deadline) - clock())));
     }
   }
-  return { preflight, spawn, inspect, capture, send, submit, cleanup, watch, result, stopCompleted, reconcile, landed };
+  return { attach, preflight, spawn, inspect, capture, send, submit, cleanup, watch, result, stopCompleted, reconcile, landed };
 }
 
 async function main() {
   const [operation, path, ...args] = process.argv.slice(2);
-  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'submit', 'watch', 'stop', 'delete', 'reconcile', 'landed', 'update'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
+  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'submit', 'watch', 'stop', 'delete', 'reconcile', 'landed', 'update', 'attach'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
   // update is local-only and entered under the ordinary metadata lock.
   if (operation === 'update') {
     let input = '';
@@ -407,7 +414,7 @@ async function main() {
     const patch = JSON.parse(input);
     const current = await readRecord(path);
     requireThat(current.backend === 'vercel' && current.run_id === patch.run_id, 'stale watcher');
-    for (const key of ['watcher_pid', 'delivery_state', 'cleanup_state', 'pr', 'head_sha', 'failure']) {
+    for (const key of ['watcher_pid', 'delivery_state', 'cleanup_state', 'pr', 'head_sha', 'failure', 'viewer_session', 'viewer_workspace', 'viewer_tab', 'viewer_pane']) {
       if (Object.hasOwn(patch, key)) current[key] = patch[key];
     }
     await saveRecord(path, current);
@@ -440,7 +447,12 @@ async function main() {
   else if (operation === 'stop' || operation === 'delete') json(await execution.cleanup(path, operation));
   else {
     const record = await readRecord(path);
-    if (operation === 'capture') process.stdout.write(await execution.capture(record, args[0] === undefined ? 100 : Number(args[0])));
+    if (operation === 'attach') {
+      requireThat(!await readFile(`${path}.cancel`).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; }), 'task cancelled');
+      const { interactive } = await import('./viewer.mjs');
+      requireThat(process.stdin.isTTY && process.stdout.isTTY, 'attach requires an interactive terminal');
+      await interactive(await execution.attach(record), record);
+    } else if (operation === 'capture') process.stdout.write(await execution.capture(record, args[0] === undefined ? 100 : Number(args[0])));
     else if (operation === 'send') {
       let text = '';
       for await (const chunk of process.stdin) {
