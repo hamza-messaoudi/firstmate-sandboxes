@@ -68,7 +68,7 @@ fm_vercel_spawn() {
       return 1
     fi
   fi
-  # One detached SDK client; no viewer or local agent process is launched.
+  # One detached SDK client owns lifecycle independently of presentation.
   nohup "$SCRIPT_DIR/backends/vercel.sh" --backend vercel reconcile "$record" \
     </dev/null >"$DATA/$ID/vercel-watch.log" 2>&1 &
   local watcher=$! ready=0 attempt
@@ -82,6 +82,11 @@ fm_vercel_spawn() {
     echo 'error: Vercel watcher failed to start; cleanup identity retained' >&2
     return 1
   fi
+  if [ "${HERDR_ENV:-}" = 1 ]; then
+    "$SCRIPT_DIR/fm-vercel-view.sh" create "$record" || echo 'warning: viewer unavailable; remote worker remains watched' >&2
+  fi
+  printf 'Manual attach: '
+  "$SCRIPT_DIR/fm-vercel-view.sh" command "$record"
   printf 'Vercel worker created for %s; local worktree changes were not included.\n' "$ID"
 }
 

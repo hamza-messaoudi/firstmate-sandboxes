@@ -2,7 +2,7 @@
 
 Vercel runs a Codex ship worker in a fork of an explicitly prepared, stopped sandbox base.
 The lifecycle integration is covered by mocked tests; live integration against the Vercel platform is still unverified (see "Live verification status").
-Herdr presentation, restart recovery, scouts, secondmates, model overrides, and additional harnesses are not implemented.
+Restart recovery, scouts, secondmates, model overrides, and additional harnesses are not implemented.
 
 Install the optional SDK with `npm ci --prefix bin/vercel` using Node 22 or later.
 Prepare a private base containing Git, GitHub CLI, tmux, Node, and Codex with the intended interactive login, then stop it with a current snapshot.
@@ -30,7 +30,7 @@ Completion means PR-ready, not merged or CI-green.
 A failed stop preserves the verified PR and leaves cleanup unresolved.
 Generic supervision reads cached evidence; the adapter's `capture` operation provides explicit bounded remote capture.
 `fm-send` refuses durable steering because this backend has no remote inbox.
-A Herdr viewer and supported attach workflow remain deferred.
+The optional Herdr viewer is independent of this watcher.
 
 Use `bin/fm-teardown.sh task-id` after the exact recorded head is verified merged.
 Use its existing `--force` only with explicit authority to discard remote work.
@@ -42,6 +42,31 @@ The adapter's `stop` operation cancels polling and stops compute while retaining
 Keep the host awake for prompt reporting; finite provider runtime remains the bound during disconnection.
 Stopped persistent storage can remain billable until explicit deletion.
 Run `bash tests/vercel.test.sh` for allocation-free execution and lifecycle checks.
+
+## Interactive viewer
+
+Launch from an existing Herdr pane to create an unfocused tab labeled `Vercel: <task-id> (viewer)` in the launcher workspace.
+The viewer uses the optional SDK installed above and Node's built-in WebSocket client; it needs no Sandbox CLI, plugin, SSH server, or local PTY dependency.
+Its terminal must inherit `VERCEL_TOKEN`; credentials are never placed in the pane command or task metadata.
+Viewer creation failure leaves the worker and watcher running and prints a manual attachment command.
+
+For manual attachment or recovery after closing a viewer, run the printed command in an interactive terminal:
+
+```sh
+bin/backends/vercel.sh --backend vercel attach "$FM_HOME/state/task-id.meta"
+```
+
+Attachment verifies the running worker and recorded session, then opens that exact SDK Session without resuming it.
+Stopped, completed, missing, expired, or changed-session workers refuse attachment.
+The connection never extends the provider timeout.
+Detach with tmux's `Ctrl-b d`, or close the viewer tab; both leave remote execution and the local watcher independent.
+The terminal connection can be reopened manually while the recorded worker is still running.
+Do not substitute `sandbox exec`: the inspected CLI automatically resumes stopped sandboxes.
+
+[bin/fm-vercel-view.sh](../bin/fm-vercel-view.sh) owns viewer creation, exact identifier persistence, safe disconnect, and manual-command printing.
+Teardown closes the recorded viewer best-effort after cloud cleanup.
+Automatic viewer recovery and completion badges are not implemented.
+Interactive keyboard, resizing, disconnect survival, and Herdr presentation are mock-tested only; live integration remains unverified.
 
 ## Live verification status
 
