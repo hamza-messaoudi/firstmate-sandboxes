@@ -413,6 +413,10 @@ async function main() {
     await saveRecord(path, current);
     return;
   }
+  // Local configuration failures must not depend on the optional provider SDK.
+  const config = operation === 'doctor' || operation === 'spawn'
+    ? configuration(JSON.parse(await readFile(operation === 'doctor' ? path : args[0], 'utf8')), process.env)
+    : undefined;
   const sdk = await import('@vercel/sandbox');
   const persist = operation !== 'reconcile' ? saveRecord : async (target, record) => {
     if (target !== path) return saveRecord(target, record);
@@ -422,11 +426,11 @@ async function main() {
   const execution = createExecution({ sdk, persist });
   const json = result => process.stdout.write(JSON.stringify(result) + '\n');
   if (operation === 'doctor') {
-    const result = await execution.preflight(JSON.parse(await readFile(path, 'utf8')));
+    const result = await execution.preflight(config);
     json({ ready: true, base_snapshot: result.snapshot_id, base_sha: result.base_sha,
       tools: 'checked on fork before launch', live_agent_auth: 'unverified' });
   } else if (operation === 'spawn') {
-    const result = await execution.spawn(path, JSON.parse(await readFile(args[0], 'utf8')), await readFile(args[1], 'utf8'));
+    const result = await execution.spawn(path, config, await readFile(args[1], 'utf8'));
     process.stderr.write('Worker starts from remote committed code; local changes are not included.\n');
     json(result);
   } else if (operation === 'reconcile') await execution.reconcile(path, async (record, line) => {
