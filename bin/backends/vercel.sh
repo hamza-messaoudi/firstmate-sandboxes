@@ -8,11 +8,12 @@
 # origin (ordinary GitHub URL), git_author_name, git_author_email,
 # and timeout_ms (60000..1800000). The base must be stopped with a snapshot.
 # Tool and interactive Codex or Claude Code login preparation remain operator responsibilities.
-# spawn accepts task content only, not a local Firstmate launch brief/inbox contract.
+# spawn accepts task content only, not a local Firstmate launch brief or host inbox contract.
 # spawn: record is a NEW private .meta path; arguments: config.json task.md.
 # attach: interactive terminal viewer; session-bound, never resumes or extends timeout.
-# inspect|capture|send|submit|watch|stop|delete: record is the spawn .meta path.
+# inspect|capture|send|steer|submit|watch|stop|delete: record is the spawn .meta path.
 # capture accepts a line count (1..200); send reads literal UTF-8 text on stdin.
+# steer reads literal UTF-8 text on stdin and durably appends one remote inbox record.
 # watch accepts interval milliseconds (1000..60000) and polls without reconciliation.
 # reconcile owns result verification, evidence, normal status, and completion stop.
 # landed is a read-only exact-PR merge check; update is a run-bound local-only
@@ -30,14 +31,14 @@ set -eu
 
 VERCEL_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 if [ "${1:-}" != --backend ] || [ "${2:-}" != vercel ] || [ "$#" -lt 4 ]; then
-  echo 'usage: vercel.sh --backend vercel <doctor|spawn|inspect|capture|send|submit|watch|stop|delete|attach> <record> [arguments]' >&2
+  echo 'usage: vercel.sh --backend vercel <doctor|spawn|inspect|capture|send|steer|submit|watch|stop|delete|attach> <record> [arguments]' >&2
   exit 2
 fi
 shift 2
 VERCEL_OP=$1
 VERCEL_RECORD=$2
 shift 2
-case "$VERCEL_OP" in doctor|spawn|inspect|capture|send|submit|watch|stop|delete|reconcile|landed|update|attach) ;; *) exit 2 ;; esac
+case "$VERCEL_OP" in doctor|spawn|inspect|capture|send|steer|submit|watch|stop|delete|reconcile|landed|update|attach) ;; *) exit 2 ;; esac
 VERCEL_PARENT=$(cd "$(dirname "$VERCEL_RECORD")" && pwd -P)
 VERCEL_RECORD="$VERCEL_PARENT/$(basename "$VERCEL_RECORD")"
 # Scope the lock library's directory initialization to this explicit record.
@@ -61,7 +62,7 @@ trap vercel_finish EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
 case "$VERCEL_OP" in
-  spawn|send|submit|stop|delete|update) VERCEL_LOCK=$(fm_meta_lock_path "$VERCEL_RECORD") ;;
+  spawn|send|steer|submit|stop|delete|update) VERCEL_LOCK=$(fm_meta_lock_path "$VERCEL_RECORD") ;;
   watch|reconcile) VERCEL_LOCK="$VERCEL_RECORD.watch.lock" ;;
 esac
 case "$VERCEL_OP" in

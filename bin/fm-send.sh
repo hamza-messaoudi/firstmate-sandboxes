@@ -20,9 +20,10 @@
 # INBOX - the default for text to a task recorded in this home, local and
 # remote alike. The message is appended as a durable sequenced record under
 # the task's steering inbox (newlines are legal) - state/<id>.inbox/ for a
-# local task, or the remote home's host-local inbox reached through fm-on.sh
-# for a remote secondmate - and the terminal receives only one short constant
-# self-describing doorbell line plus Enter, best-effort. The durable record IS
+# local task, the remote home's host-local inbox reached through fm-on.sh for a
+# remote secondmate, or the sandbox-local inbox for a Vercel task - and the
+# terminal receives only one short constant self-describing doorbell line plus
+# Enter, best-effort. The durable record IS
 # the delivery, so the record's fate alone governs the exit: 0 = the steer is
 # durably sent (recorded); nonzero = nothing was confirmed delivered and a
 # resend is appropriate (unresolvable target, an endpoint that cannot be
@@ -371,10 +372,6 @@ fm_send_resolve_target() { # <raw-target>
       return 1
     fi
     backend=$(fm_backend_of_meta "$meta")
-    if [ "$backend" = vercel ]; then
-      echo 'error: Vercel has no durable steering inbox; use direct interactive attachment' >&2
-      return 1
-    fi
     RESOLVED_TARGET=$target
     TARGET_BACKEND=$backend
     TARGET_META=$meta
@@ -741,6 +738,18 @@ fm_send_feed_resolved_holds() { # <answer-text>
   fi
 }
 
+# The Vercel worker's inbox lives inside the sandbox, so its doorbell cannot
+# use fm_task_inbox_doorbell_line's host-local path. The remote path is returned
+# by the adapter after the durable write and is safe to quote as a literal
+# shell-path in the constant pane nudge.
+fm_send_vercel_doorbell_line() { # <remote-inbox-dir>
+  local dir=$1 quoted
+  [ -n "$dir" ] || return 1
+  case "$dir" in *[![:print:]]*) return 1 ;; esac
+  quoted=$(printf '%s' "$dir" | sed "s/'/'\\\\''/g")
+  printf ": Firstmate instruction waiting: list '%s'/*.msg and, in numeric order, read and act on each, then mv each handled file to '%s'/handled/." "$quoted" "$quoted"
+}
+
 # Resolve the target's harness from its meta (recorded by fm-spawn), used only to
 # scope the codex `$<skill>` popup-settle below. A task selector carries
 # meta; an explicit backend-target escape hatch has none, so its harness is
@@ -1002,6 +1011,42 @@ else
   fi
   if [ "$INBOX_PLANE" = 1 ]; then
     INBOX_TASK_ID=$(fm_send_id_from_meta "$TARGET_META")
+    if [ "$TARGET_BACKEND" = vercel ]; then
+      INBOX_RESULT=
+      if ! INBOX_RESULT=$(printf '%s' "$MESSAGE" | "$FM_ROOT/bin/backends/vercel.sh" --backend vercel steer "$T"); then
+        echo "error: steer not sent to $INBOX_TASK_ID: the Vercel remote inbox record could not be written" >&2
+        exit 1
+      fi
+      INBOX_RECORD=$(printf '%s' "$INBOX_RESULT" | jq -er '.path | strings') || {
+        echo "error: steer not sent to $INBOX_TASK_ID: Vercel returned an invalid remote inbox record" >&2
+        exit 1
+      }
+      INBOX_DIR=${INBOX_RECORD%/*}
+      case "$INBOX_RECORD" in
+        "$INBOX_DIR"/[0-9]*.msg) ;;
+        *) echo "error: steer not sent to $INBOX_TASK_ID: Vercel returned an unsafe remote inbox path" >&2; exit 1 ;;
+      esac
+      if [ -n "$PENDING_REPLY_CORR" ]; then
+        fm_pending_reply_confirm_delivery "$STATE" "$PENDING_REPLY_CORR" || {
+          echo "error: the steer was delivered to the Vercel remote inbox, but its pending-reply delivery commit failed; do not resend" >&2
+          exit 1
+        }
+      fi
+      if [ -n "$RESOLVE_KEYS" ]; then
+        fm_send_close_resolved_keys "$RESOLVE_ANSWER_TEXT" || exit 1
+        fm_send_feed_resolved_holds "$RESOLVE_ANSWER_TEXT" || exit 1
+      fi
+      ring_rc=0
+      if ! DOORBELL=$(fm_send_vercel_doorbell_line "$INBOX_DIR") ||
+        ! printf '%s' "$DOORBELL" | "$FM_ROOT/bin/backends/vercel.sh" --backend vercel send "$T" >/dev/null ||
+        ! "$FM_ROOT/bin/backends/vercel.sh" --backend vercel submit "$T" >/dev/null; then
+        ring_rc=2
+      fi
+      if [ "$ring_rc" -ne 0 ]; then
+        echo "fm-send: Vercel doorbell did not reach $T; the steer is durably recorded at $INBOX_RECORD and the worker will poll the remote inbox" >&2
+      fi
+      exit 0
+    fi
     INBOX_META_LOCK=$(fm_meta_lock_path "$TARGET_META") || exit 1
     if ! fm_task_inbox_lock_acquire "$INBOX_META_LOCK"; then
       if [ "$PENDING_REPLY_CREATED" = 1 ] && [ -n "$PENDING_REPLY_CORR" ]; then
