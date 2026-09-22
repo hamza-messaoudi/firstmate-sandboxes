@@ -4,10 +4,10 @@
 # Install optional SDK: npm ci --prefix bin/vercel (Node >=22).
 # Credentials are environment-only: VERCEL_TOKEN and GH_TOKEN.
 # doctor: record is a config JSON file with backend=vercel, mode=ship,
-# delivery=direct-PR, harness=codex, task_id, base_name, team_id, project_id,
+# delivery=direct-PR, harness=codex|claude, task_id, base_name, team_id, project_id,
 # origin (ordinary GitHub URL), git_author_name, git_author_email,
 # and timeout_ms (60000..1800000). The base must be stopped with a snapshot.
-# Tool and interactive Codex login preparation remain operator responsibilities.
+# Tool and interactive Codex or Claude Code login preparation remain operator responsibilities.
 # spawn accepts task content only, not a local Firstmate launch brief/inbox contract.
 # spawn: record is a NEW private .meta path; arguments: config.json task.md.
 # attach: interactive terminal viewer; session-bound, never resumes or extends timeout.

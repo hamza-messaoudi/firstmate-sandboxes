@@ -1,12 +1,12 @@
 # Experimental Vercel backend
 
-Vercel runs a Codex ship worker in a fork of an explicitly prepared, stopped sandbox base.
-The lifecycle integration is covered by mocked tests; live integration against the Vercel platform is still unverified (see "Live verification status").
-Restart recovery, scouts, secondmates, model overrides, and additional harnesses are not implemented.
+Vercel runs a ship worker in a fork of an explicitly prepared, stopped sandbox base, using the Codex or Claude Code CLI as the remote harness.
+The lifecycle integration is covered by mocked tests; live integration against the Vercel platform has now been proven for the Codex harness end to end (see "Live verification status"), while the Claude Code harness remains live-unverified.
+Restart recovery, scouts, secondmates, and model overrides are not implemented.
 
 Install the optional SDK with `npm ci --prefix bin/vercel` using Node 22 or later.
-Prepare a private base containing Git, GitHub CLI, tmux, Node, and Codex with the intended interactive login, then stop it with a current snapshot.
-Base preparation and inherited Codex authentication require separate live verification.
+Prepare a private base containing Git, GitHub CLI, tmux, Node, and the intended harness (Codex, Claude Code, or both) with their interactive login, then stop it with a current snapshot.
+Base preparation and inherited harness authentication require separate live verification per harness; the harness's login is never baked into config or shipped as a secret.
 Keep `VERCEL_TOKEN` and `GH_TOKEN` in the launching environment, never in configuration or the prepared base.
 
 Create the private `config/vercel.json` with `base_name`, `team_id`, `project_id`, `git_author_name`, `git_author_email`, and finite `timeout_ms` between 60000 and 1800000.
@@ -17,6 +17,8 @@ Launch explicitly:
 ```sh
 bin/fm-spawn.sh task-id projects/project --backend vercel --harness codex --mode direct-PR --yolo off
 ```
+
+`--harness codex` and `--harness claude` are the only accepted values; the base must have that exact CLI installed and logged in.
 
 Explicit `FM_BACKEND=vercel` and `config/backend` selection also work; Vercel is never auto-detected.
 Only the Task content is uploaded; local launch, status, inbox, and hook instructions are excluded.
@@ -66,23 +68,27 @@ Do not substitute `sandbox exec`: the inspected CLI automatically resumes stoppe
 [bin/fm-vercel-view.sh](../bin/fm-vercel-view.sh) owns viewer creation, exact identifier persistence, safe disconnect, and manual-command printing.
 Teardown closes the recorded viewer best-effort after cloud cleanup.
 Automatic viewer recovery and completion badges are not implemented.
-Interactive keyboard, resizing, disconnect survival, and Herdr presentation are mock-tested only; live integration remains unverified.
+Interactive keyboard, resizing, and Herdr presentation are proven live for a still-running worker (see "Live verification status"); disconnect survival across a real network drop remains mock-tested only.
 
 ## Live verification status
 
-Checked on 2026-09-20 with Vercel CLI 59.23.2, Node 24.20.0, and the captain's logged-in CLI session (teams `hamzas-projects-9e6e8e46` on hobby and `shiva-257d6eb4` on pro).
-The CLI login is not usable by the adapter, which reads only `VERCEL_TOKEN` and `GH_TOKEN` from the environment, and neither was exported.
+Checked on 2026-09-22 with Vercel CLI 59.23.2, Node 24.20.0, real `VERCEL_TOKEN`/`GH_TOKEN` exported to the launching environment, team `hamzas-projects-9e6e8e46`, and project `hybrid-factory`.
 
-Proven:
-- `npm ci --prefix bin/vercel` installs the SDK cleanly and `bash tests/vercel.test.sh` passes.
-- `vercel sandbox list` works through the CLI login for both teams and shows no sandboxes, so no base has been prepared yet.
-- The doctor operation stops before any provider call when the credentials are absent.
-  It now prints its own validation message, such as the missing credentials, instead of only a generic failure; provider errors are still never echoed.
+Proven, against the real Vercel provider and the real `hamza-messaoudi/firstmate-sandboxes` GitHub repository:
+- `npm ci --prefix bin/vercel` installs the SDK cleanly and `bash tests/vercel.test.sh` passes (67 tests).
+- A base named `poc-unit` was created fresh, provisioned with Git, GitHub CLI, tmux, Node 24, the Codex CLI, and the Claude Code CLI (no credentials or login baked in), then stopped with a current snapshot; the doctor operation accepted it and returned a real snapshot id and base commit SHA.
+- Real Codex sign-in inside a forked sandbox (ChatGPT device-code flow), followed by the remote Codex worker autonomously implementing the assigned one-file task, committing, pushing, and opening a real GitHub pull request, proven twice end to end (`fm-vlv3-live4`/PR #5 pre-Claude-Code-work, and after adding the Claude harness, `fm-vlv3-live6`/PR #6 and `fm-vlv3-live7`/PR #7 in the same session): each PR's `head.sha` and repository identity matched the adapter's recorded result exactly, and the completion watcher auto-stopped the sandbox immediately after verifying it against GitHub. All three probe PRs were closed (not merged) as disposable smoke-test artifacts and their branches deleted.
+- Provider timeout/stop behavior: an unattended test sandbox (`fm-vlv3-live`) was left at the Codex sign-in screen until its recorded deadline; the watcher independently detected `deadline expired`, marked the task `interrupted`, and a subsequent attach attempt was correctly refused ("task is not running") without resuming it.
+- Deletion/teardown: every short-lived test sandbox (`fm-vlv3-live` through `fm-vlv3-live8`) was torn down through `bin/fm-teardown.sh --force` and confirmed absent from a live `Sandbox.list`; only the prepared base `poc-unit` remains, in `stopped` status with a current snapshot.
+- The Herdr interactive viewer was exercised fully automatically (no manual captain timing) against a still-running worker (`fm-vlv3-live8`, tmux session `fm-6b444e91a0f14b5aaca56bd8c6c4ea82`, remote SDK session `2f66fcf8-506...`): `fm-vercel-view.sh create` attached one client and showed live pane content, `disconnect` closed exactly that pane and left the remote tmux session and sandbox running with zero attached clients, and a fresh manual-attach reconnect showed the identical session id and pane content, proving continuity across detach/reattach with no resume of a stopped worker. Attaching to an already-completed or already-stopped task was independently confirmed refused.
+- Real authentication failure mode observed live (not injected): the Codex account under test hit its own usage/rate limit mid-run and Codex reported it directly in the pane; the adapter took no incorrect action on that condition, and it resolved on retry.
 
-Not yet proven, pending a live base and tokens: doctor against a real stopped base, spawn, a Codex worker running and reporting completion, real authentication failure modes, provider timeout behavior, and stop and teardown against real sandboxes.
-The doctor's `live_agent_auth: unverified` field stays accurate until then.
+Not yet proven:
+- Claude Code as the live remote harness: two attempts to complete an interactive Claude Code login inside the sandbox lifetime did not finish before either the provider deadline or the operator's availability window closed, so its login/execution/completion path is implemented and unit-tested but still live-unverified. The Codex path above stands in for the shared spawn/watch/result/cleanup machinery both harnesses use.
+- Real authentication *failure* (invalid/expired token) end to end; only the credential-absent path and a live usage-limit condition were observed.
+- Disconnect survival across an actual dropped network connection to the viewer (only an explicit close/detach was exercised).
 
 Follow-up work, not implemented and not assessed live:
-- Full Claude and Codex parity: only ship, direct-PR, and Codex are supported.
+- Full harness parity beyond Codex and Claude Code: only ship, direct-PR, and those two harnesses are supported.
 - Durable remote steering inbox: `fm-send` refuses steering because no remote inbox exists.
 - Restart reconciliation: a restarted Firstmate cannot recover a running remote worker.
