@@ -2,8 +2,8 @@
 # Vercel-only lifecycle helpers sourced by fm-spawn/fm-teardown.
 # Spawn reads config/vercel.json (base_name, team_id, project_id, timeout_ms,
 # git_author_name, git_author_email), extracts only # Task from the normal
-# brief, and derives origin from the read-only project. Only explicit codex,
-# ship/direct-PR/yolo=off is supported; no profiles, relaunch, or local worktree.
+# brief, and derives origin from the read-only project. Only explicit codex or
+# claude, ship/direct-PR/yolo=off is supported; no profiles, relaunch, or local worktree.
 # Teardown requires a GitHub-verified merged recorded head, or explicit --force
 # discard authority. Cancel, then wait for the single watcher before deletion.
 # Cloud failures retain metadata and evidence even with --force.
@@ -11,9 +11,9 @@
 fm_vercel_spawn() {
   local project config brief task config_tmp task_tmp record
   [ "$KIND" = ship ] && [ "$MODE" = direct-PR ] && [ "$YOLO" = off ] \
-    && [ "$HARNESS_ARG" = codex ] && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] \
+    && { [ "$HARNESS_ARG" = codex ] || [ "$HARNESS_ARG" = claude ]; } && [ "$MODEL_SET" = 0 ] && [ "$EFFORT_SET" = 0 ] \
     && [ "${#POS[@]}" -eq 2 ] || {
-    echo 'error: Vercel supports only ship --mode direct-PR --yolo off --harness codex, without model/effort overrides' >&2
+    echo 'error: Vercel supports only ship --mode direct-PR --yolo off --harness codex|claude, without model/effort overrides' >&2
     return 1
   }
   project=${POS[1]}
@@ -44,8 +44,8 @@ fm_vercel_spawn() {
   config_tmp=$(mktemp "$STATE/.vercel-config.XXXXXX") || return 1
   task_tmp=$(mktemp "$STATE/.vercel-task.XXXXXX") || { rm -f "$config_tmp"; return 1; }
   if ! jq --arg task "$ID" --arg project "$project" \
-    --arg origin "$(git -C "$project" remote get-url origin)" \
-    '. + {backend:"vercel",mode:"ship",delivery:"direct-PR",harness:"codex",task_id:$task,local_project:$project,origin:$origin}' \
+    --arg origin "$(git -C "$project" remote get-url origin)" --arg harness "$HARNESS_ARG" \
+    '. + {backend:"vercel",mode:"ship",delivery:"direct-PR",harness:$harness,task_id:$task,local_project:$project,origin:$origin}' \
     "$config" >"$config_tmp"; then
     rm -f "$config_tmp" "$task_tmp"
     return 1

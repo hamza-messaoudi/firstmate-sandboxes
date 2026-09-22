@@ -40,12 +40,19 @@ const signal = () => AbortSignal.timeout(REQUEST_MS);
 const missing = error => error?.status === 404 || error?.statusCode === 404 || error?.response?.status === 404;
 class ConfigError extends Error {}
 function requireThat(condition, message) { if (!condition) throw new ConfigError(message); }
+// Supported remote worker CLIs: the prepared base must provide the binary and the operator completes its login.
+const HARNESSES = {
+  codex: 'codex --dangerously-bypass-approvals-and-sandbox',
+  claude: 'claude --dangerously-skip-permissions',
+};
+// Exact-match tmux pane target: "=session" resolves only as a session, so pane commands need "=session:".
+const paneTarget = record => `=${record.tmux_session}:`;
 function safeText(value) { return typeof value === 'string' && value.length > 0 && !/[\r\n\0]/.test(value); }
 
 export function configuration(config, env) {
   requireThat(config.backend === 'vercel', 'explicit backend=vercel required');
-  requireThat(config.mode === 'ship' && config.delivery === 'direct-PR' && config.harness === 'codex',
-    'only ship/direct-PR/codex is supported');
+  requireThat(config.mode === 'ship' && config.delivery === 'direct-PR' && Object.hasOwn(HARNESSES, config.harness),
+    'only ship/direct-PR with the codex or claude harness is supported');
   requireThat(validId(config.task_id) && config.task_id.length <= 30, 'invalid task identity');
   for (const key of ['base_name', 'team_id', 'project_id']) requireThat(validId(config[key]), `invalid ${key}`);
   requireThat(Number.isInteger(config.timeout_ms) && config.timeout_ms >= 60000 && config.timeout_ms <= 1800000,
@@ -203,7 +210,7 @@ export function createExecution({ sdk, env = process.env, fetcher = fetch, provi
       requireThat(sandbox.sourceSnapshotId === snapshot_id, 'fork did not use validated base snapshot');
       requireThat(record.session_id && sandbox.status === 'running', 'fork has no running session');
       // Verify actual worker binaries before repository setup. The stopped base is never executed.
-      await command(record, 'sh', ['-ceu', 'for tool in git gh tmux node codex; do command -v "$tool" >/dev/null; done']);
+      await command(record, 'sh', ['-ceu', `for tool in git gh tmux node ${record.harness}; do command -v "$tool" >/dev/null; done`]);
       const setup = `set -eu
 umask 077
 git config --global credential.https://github.com.helper '!gh auth git-credential'
@@ -226,7 +233,7 @@ Implement and test the task, commit, push this branch, and open a direct PR agai
 After a successful push and PR creation, run: node ${record.remote_run_dir}/complete.mjs <full-PR-URL>
 Do not merge. Do not run local Firstmate supervision or use local orchestration hooks.
 \nTask:\n${brief}\n`;
-      const launch = `#!/bin/sh\nset -eu\ncd ${quote(REPO_PATH)}\nexec codex --dangerously-bypass-approvals-and-sandbox "$(cat ${quote(record.remote_run_dir + '/brief.md')})"\n`;
+      const launch = `#!/bin/sh\nset -eu\ncd ${quote(REPO_PATH)}\nexec ${HARNESSES[record.harness]} "$(cat ${quote(record.remote_run_dir + '/brief.md')})"\n`;
       const current = await session(record);
       await current.writeFiles([
         { path: `${record.remote_run_dir}/brief.md`, content: remoteBrief, mode: 0o600 },
@@ -261,19 +268,21 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
   async function capture(record, lines = 100) {
     requireThat(Number.isInteger(lines) && lines >= 1 && lines <= 200, 'capture lines must be 1..200');
     // Bound remotely before SDK buffers stdout; tmux history may contain huge lines.
+    // Pane targets need the trailing colon (tmux: "=session" alone is no pane), and
+    // the capture runs outside the pipe so a tmux failure is not masked by tail.
     const result = await command(record, 'sh', ['-ceu',
-      `tmux capture-pane -p -t ${quote('=' + record.tmux_session)} -S -${lines} | tail -c ${OUTPUT_BYTES}`]);
+      `out=$(tmux capture-pane -p -t ${quote(paneTarget(record))} -S -${lines}); printf '%s' "$out" | tail -c ${OUTPUT_BYTES}`]);
     const output = await result.stdout();
     return Buffer.from(output).subarray(-OUTPUT_BYTES).toString('utf8');
   }
   async function send(record, text) {
     requireThat(typeof text === 'string' && Buffer.byteLength(text) <= 8192 && !text.includes('\0'), 'literal input must be at most 8192 bytes without NUL');
     // argv transport, literal flag, and separate submit. Never retry ambiguous input.
-    await command(record, 'tmux', ['send-keys', '-t', `=${record.tmux_session}`, '-l', '--', text]);
+    await command(record, 'tmux', ['send-keys', '-t', paneTarget(record), '-l', '--', text]);
     return { sent: true };
   }
   async function submit(record) {
-    await command(record, 'tmux', ['send-keys', '-t', `=${record.tmux_session}`, 'Enter']);
+    await command(record, 'tmux', ['send-keys', '-t', paneTarget(record), 'Enter']);
     return { submitted: true };
   }
   async function cleanup(path, operation) {

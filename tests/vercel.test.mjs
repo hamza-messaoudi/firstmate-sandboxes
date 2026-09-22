@@ -91,7 +91,7 @@ test('doctor validates credentials, remote revision and stopped current snapshot
   assert.equal(f.calls.filter(([kind]) => kind === 'fork' || kind === 'command').length, 0);
 }));
 for (const [name, change] of Object.entries({ implicit: { backend: undefined }, scout: { mode: 'scout' },
-  local: { delivery: 'local-only' }, harness: { harness: 'claude' }, identity: { task_id: '../bad' },
+  local: { delivery: 'local-only' }, harness: { harness: 'gemini' }, identity: { task_id: '../bad' },
   timeout: { timeout_ms: Infinity }, origin: { origin: 'https://user:password@github.com/owner/repo' } })) {
   test(`unsupported ${name} fails before network/allocation`, () => using({}, async f => {
     await assert.rejects(f.spawn(change));
@@ -139,6 +139,19 @@ test('spawn persists exact identity, finite timeout and worker-only environment;
   assert.equal(f.calls.filter(([kind]) => kind === 'stop' || kind === 'delete').length, 0);
   await assert.rejects(f.spawn(), /record already exists/);
 }));
+
+for (const [harness, launch] of [['codex', 'exec codex --dangerously-bypass-approvals-and-sandbox '],
+  ['claude', 'exec claude --dangerously-skip-permissions ']]) {
+  test(`${harness} harness verifies its own binary and launches it from the tmux script`, () => using({}, async f => {
+    const record = await f.spawn({ harness });
+    assert.equal(record.harness, harness);
+    const commands = f.calls.filter(([kind]) => kind === 'command').map(([, command]) => command);
+    const tools = commands.find(c => c.args?.[1]?.includes('for tool in')).args[1];
+    assert.match(tools, new RegExp(`tmux node ${harness};`));
+    const files = f.calls.find(([kind]) => kind === 'files')[1];
+    assert.ok(files.find(file => file.path.endsWith('/launch.sh')).content.includes(launch));
+  }));
+}
 
 test('ambiguous allocation recovers exact intended name without a second fork', () => using({ forkFails: true }, async f => {
   const record = await f.spawn();
@@ -189,6 +202,15 @@ test('capture validates bounds and limits bytes', () => using({ stdout: 'x'.repe
   await assert.rejects(f.execution.capture(record, -1));
 }));
 
+test('capture targets the pane with an exact-match session colon and is not masked by the tail pipe', () => using({}, async f => {
+  const record = await f.spawn();
+  f.calls.length = 0;
+  await f.execution.capture(record, 10);
+  const script = f.calls.find(([kind]) => kind === 'command')[1].args.at(-1);
+  assert.ok(script.includes(`-t '=${record.tmux_session}:'`), script);
+  assert.match(script, /^out=\$\(tmux capture-pane [^|]*\); /, 'tmux failure must not be masked by the pipe');
+}));
+
 test('literal quotes/newlines remain one argv value and submission is separate', () => using({}, async f => {
   const record = await f.spawn();
   f.calls.length = 0;
@@ -196,10 +218,10 @@ test('literal quotes/newlines remain one argv value and submission is separate',
   await f.execution.send(record, text);
   const command = f.calls.find(([kind]) => kind === 'command')[1];
   assert.equal(command.cmd, 'tmux');
-  assert.deepEqual(command.args, ['send-keys', '-t', `=${record.tmux_session}`, '-l', '--', text]);
+  assert.deepEqual(command.args, ['send-keys', '-t', `=${record.tmux_session}:`, '-l', '--', text]);
   await f.execution.submit(record);
   assert.deepEqual(f.calls.filter(([kind]) => kind === 'command').at(-1)[1].args,
-    ['send-keys', '-t', `=${record.tmux_session}`, 'Enter']);
+    ['send-keys', '-t', `=${record.tmux_session}:`, 'Enter']);
   await assert.rejects(f.execution.send(record, '\0'));
   await assert.rejects(f.execution.send(record, 'a'.repeat(8193)));
 }));
