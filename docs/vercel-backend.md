@@ -21,7 +21,8 @@ bin/fm-spawn.sh task-id projects/project --backend vercel --harness codex --mode
 `--harness codex` and `--harness claude` are the only accepted values; the base must have that exact CLI installed and logged in.
 
 Explicit `FM_BACKEND=vercel` and `config/backend` selection also work; Vercel is never auto-detected.
-Only the Task content is uploaded; local launch, status, inbox, and hook instructions are excluded.
+Only the Task content enters the worker's task brief; host launch, status, and hook instructions are excluded.
+The sandbox also receives the worker-local launch helper, completion helper, and durable steering-inbox instructions.
 Workers start from the GitHub default branch's resolved commit, so local uncommitted and unpushed work is not included.
 No local worktree is allocated, inspected as a remote repository, or returned to Treehouse.
 
@@ -31,7 +32,11 @@ The existing Firstmate watcher and Pi extension deliver that event; the ordinary
 Completion means PR-ready, not merged or CI-green.
 A failed stop preserves the verified PR and leaves cleanup unresolved.
 Generic supervision reads cached evidence; the adapter's `capture` operation provides explicit bounded remote capture.
-`fm-send` refuses durable steering because this backend has no remote inbox.
+`fm-send` writes text steers to the sandbox's `remote_inbox_dir` as sequenced `NNN.msg` records through the Vercel SDK's `writeFiles` operation.
+The adapter stages each record as a hidden file and atomically renames it into the inbox after allocating the next sequence across both the inbox and `handled/` directories.
+The remote worker polls those records in numeric order, acts on each body after the `--` separator, and acknowledges it by moving the exact file into `handled/`.
+After the durable write, `fm-send` uses the existing literal `send` and `submit` operations to ring the worker with a constant doorbell containing the remote inbox path.
+The doorbell is best-effort because the remote record is the delivery proof and the worker's acknowledgement move is the processing proof.
 The optional Herdr viewer is independent of this watcher.
 
 Use `bin/fm-teardown.sh task-id` after the exact recorded head is verified merged.
@@ -75,7 +80,7 @@ Interactive keyboard, resizing, and Herdr presentation are proven live for a sti
 Checked on 2026-09-22 with Vercel CLI 59.23.2, Node 24.20.0, real `VERCEL_TOKEN`/`GH_TOKEN` exported to the launching environment, team `hamzas-projects-9e6e8e46`, and project `hybrid-factory`.
 
 Proven, against the real Vercel provider and the real `hamza-messaoudi/firstmate-sandboxes` GitHub repository:
-- `npm ci --prefix bin/vercel` installs the SDK cleanly and `bash tests/vercel.test.sh` passes (67 tests).
+- `npm ci --prefix bin/vercel` installs the SDK cleanly and `bash tests/vercel.test.sh` passes (69 tests).
 - A base named `poc-unit` was created fresh, provisioned with Git, GitHub CLI, tmux, Node 24, the Codex CLI, and the Claude Code CLI (no credentials or login baked in), then stopped with a current snapshot; the doctor operation accepted it and returned a real snapshot id and base commit SHA.
 - Real Codex sign-in inside a forked sandbox (ChatGPT device-code flow), followed by the remote Codex worker autonomously implementing the assigned one-file task, committing, pushing, and opening a real GitHub pull request, proven twice end to end (`fm-vlv3-live4`/PR #5 pre-Claude-Code-work, and after adding the Claude harness, `fm-vlv3-live6`/PR #6 and `fm-vlv3-live7`/PR #7 in the same session): each PR's `head.sha` and repository identity matched the adapter's recorded result exactly, and the completion watcher auto-stopped the sandbox immediately after verifying it against GitHub. All three probe PRs were closed (not merged) as disposable smoke-test artifacts and their branches deleted.
 - Provider timeout/stop behavior: an unattended test sandbox (`fm-vlv3-live`) was left at the Codex sign-in screen until its recorded deadline; the watcher independently detected `deadline expired`, marked the task `interrupted`, and a subsequent attach attempt was correctly refused ("task is not running") without resuming it.
@@ -87,8 +92,8 @@ Not yet proven:
 - Claude Code as the live remote harness: two attempts to complete an interactive Claude Code login inside the sandbox lifetime did not finish before either the provider deadline or the operator's availability window closed, so its login/execution/completion path is implemented and unit-tested but still live-unverified. The Codex path above stands in for the shared spawn/watch/result/cleanup machinery both harnesses use.
 - Real authentication *failure* (invalid/expired token) end to end; only the credential-absent path and a live usage-limit condition were observed.
 - Disconnect survival across an actual dropped network connection to the viewer (only an explicit close/detach was exercised).
+- Durable remote steering has not been exercised against a live sandbox; the remote inbox write, worker prompt contract, and `fm-send` doorbell path are covered by mocked and unit tests.
 
 Follow-up work, not implemented and not assessed live:
 - Full harness parity beyond Codex and Claude Code: only ship, direct-PR, and those two harnesses are supported.
-- Durable remote steering inbox: `fm-send` refuses steering because no remote inbox exists.
 - Restart reconciliation: a restarted Firstmate cannot recover a running remote worker.

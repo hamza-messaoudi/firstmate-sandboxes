@@ -17,7 +17,7 @@ test('private atomic metadata roundtrip, preserves equals and rejects newlines',
 });
 
 import { createExecution, completionSource, singleAttemptFetch } from '../bin/vercel/fm-vercel.mjs';
-import { writeFile, stat } from 'node:fs/promises';
+import { writeFile, stat, mkdir } from 'node:fs/promises';
 import { execFileSync, spawnSync } from 'node:child_process';
 const config = { backend: 'vercel', mode: 'ship', delivery: 'direct-PR', harness: 'codex', task_id: 'test',
   base_name: 'prepared', team_id: 'team_test', project_id: 'prj_test', timeout_ms: 60000,
@@ -36,7 +36,9 @@ async function fixture(options = {}) {
     async runCommand(params) {
       calls.push(['command', params]);
       if (options.commandFails) throw new Error('worker-secret');
-      return { exitCode: options.exitCode || 0, stdout: async () => options.stdout || 'screen\n' };
+      const steerCommand = params.cmd === 'sh' && params.args?.[1]?.includes('staging-');
+      return { exitCode: options.exitCode || 0,
+        stdout: async () => steerCommand && options.steerPath ? `${options.steerPath}\n` : options.stdout || 'screen\n' };
     },
     async writeFiles(files) { calls.push(['files', files]); if (options.writeFails) throw Error('upload'); },
   };
@@ -117,6 +119,7 @@ test('spawn persists exact identity, finite timeout and worker-only environment;
   assert.equal(record.deadline, 61000);
   assert.equal(record.team_id, config.team_id);
   assert.equal(record.project_id, config.project_id);
+  assert.equal(record.remote_inbox_dir, `${record.remote_run_dir}/inbox`);
   assert.equal((await stat(f.path)).mode & 0o777, 0o600);
   const raw = await readFile(f.path, 'utf8');
   assert.ok(!raw.includes('secret'));
@@ -127,6 +130,7 @@ test('spawn persists exact identity, finite timeout and worker-only environment;
   const commands = f.calls.filter(([kind]) => kind === 'command').map(([, command]) => command);
   assert.ok(commands.some(c => c.cmd === 'tmux' && c.args[0] === 'new-session'));
   assert.ok(commands.some(c => c.cmd === 'tmux' && c.args[0] === 'has-session'));
+  assert.ok(commands.some(c => c.args?.[1]?.includes(`${record.remote_inbox_dir}/handled`)));
   assert.ok(commands.every(c => c.signal instanceof AbortSignal && c.timeoutMs === 20000));
   const setup = commands.find(c => c.args?.[1]?.includes('git clone')).args[1];
   assert.match(setup, /gh auth git-credential/);
@@ -135,9 +139,28 @@ test('spawn persists exact identity, finite timeout and worker-only environment;
   const files = f.calls.find(([kind]) => kind === 'files')[1];
   assert.equal(files.length, 3);
   assert.ok(files.every(file => file.path.startsWith(record.remote_run_dir + '/')));
+  assert.match(files.find(file => file.path.endsWith('/brief.md')).content, /Durable Firstmate steering inbox/);
+  assert.match(files.find(file => file.path.endsWith('/brief.md')).content, /mv -- <message-file>/);
   assert.ok(!JSON.stringify(files).includes('control-secret'));
   assert.equal(f.calls.filter(([kind]) => kind === 'stop' || kind === 'delete').length, 0);
   await assert.rejects(f.spawn(), /record already exists/);
+}));
+
+test('steer stages a remote inbox record and atomically allocates its numeric path', () => using({
+  steerPath: '/vercel/sandbox/firstmate/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/inbox/007.msg',
+}, async f => {
+  const record = await f.spawn();
+  f.calls.length = 0;
+  const text = 'please inspect this\nand acknowledge it';
+  const result = await f.execution.steer(record, text);
+  assert.deepEqual(result, { path: '/vercel/sandbox/firstmate/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/inbox/007.msg' });
+  const upload = f.calls.find(([kind]) => kind === 'files')[1][0];
+  assert.match(upload.path, /\/inbox\/\.staging-[a-f0-9]+\.msg$/);
+  assert.equal(upload.mode, 0o600);
+  assert.equal(upload.content, `schema=fm-task-inbox.v1\nat=1970-01-01T00:00:01Z\n--\n${text}`);
+  const command = f.calls.filter(([kind]) => kind === 'command').at(-1)[1];
+  assert.equal(command.cmd, 'sh');
+  assert.ok(command.args[1].includes('/inbox/'));
 }));
 
 for (const [harness, launch] of [['codex', 'exec codex --dangerously-bypass-approvals-and-sandbox '],
@@ -462,6 +485,48 @@ test('backend registration is explicit and remote endpoint validation refuses lo
   await saveRecord(f.path, { ...record, worktree: '/vercel/sandbox/repo' });
   assert.notEqual(invoke().status, 0);
 }));
+
+test('fm-send writes the Vercel remote inbox before ringing its pane', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'fm-vercel-send-'));
+  try {
+    const home = join(dir, 'home');
+    const state = join(home, 'state');
+    const fakebin = join(dir, 'fakebin');
+    await mkdir(state, { recursive: true });
+    await mkdir(fakebin, { recursive: true });
+    const meta = join(state, 'remote.meta');
+    const inbox = '/vercel/sandbox/firstmate/run/inbox';
+    await writeFile(meta, [
+      'backend=vercel', 'task_id=remote', 'endpoint_task_id=remote', `window=${meta}`,
+      'worktree=', 'kind=ship', 'harness=codex', 'run_id=run', 'delivery_state=running',
+      'spawn_gen=s1', `remote_inbox_dir=${inbox}`, 'remote_run_dir=/vercel/sandbox/firstmate/run',
+    ].join('\n') + '\n');
+    const log = join(dir, 'send.log');
+    await writeFile(join(fakebin, 'node'), `#!/bin/sh
+case "$1" in
+  */fm-vercel.mjs)
+    case "$2" in
+      steer) body=$(cat); printf 'steer\\n%s\\n' "$body" >> "$VERCEL_SEND_LOG"; printf '%s\\n' '{"path":"${inbox}/001.msg"}' ;;
+      send) body=$(cat); printf 'send\\n%s\\n' "$body" >> "$VERCEL_SEND_LOG"; printf '%s\\n' '{"sent":true}' ;;
+      submit) printf 'submit\\n' >> "$VERCEL_SEND_LOG"; printf '%s\\n' '{"submitted":true}' ;;
+      *) exit 9 ;;
+    esac ;;
+  *) exec ${quote(process.execPath)} "$@" ;;
+esac
+`, { mode: 0o700 });
+    const result = spawnSync('bash', ['bin/fm-send.sh', 'remote', 'follow up remotely'], {
+      cwd: process.cwd(), encoding: 'utf8',
+      env: { ...process.env, PATH: `${fakebin}:${process.env.PATH}`, FM_HOME: home,
+        FM_ROOT_OVERRIDE: process.cwd(), FM_GATE_REFUSE_BYPASS: '1', FM_SEND_SETTLE: '0', VERCEL_SEND_LOG: log },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const output = await readFile(log, 'utf8');
+    assert.match(output, /steer\nfollow up remotely/);
+    assert.match(output, /send\n: Firstmate instruction waiting: list '\/vercel\/sandbox\/firstmate\/run\/inbox'\/\*\.msg/);
+    assert.match(output, /submit\n/);
+    assert.doesNotMatch(output, /remote\.meta/);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
 
 test('spawn entrypoint refuses unsupported modes before provider or worktree allocation', () => using({}, async f => {
   const { mkdir } = await import('node:fs/promises');

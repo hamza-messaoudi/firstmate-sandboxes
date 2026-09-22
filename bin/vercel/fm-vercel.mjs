@@ -33,6 +33,7 @@ export async function readRecord(path) {
 }
 
 const REPO_PATH = '/vercel/sandbox/repo';
+const INBOX_SCHEMA = 'fm-task-inbox.v1';
 const REQUEST_MS = 20000;
 const OUTPUT_BYTES = 32768;
 const validId = value => typeof value === 'string' && /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(value);
@@ -188,6 +189,7 @@ export function createExecution({ sdk, env = process.env, fetcher = fetch, provi
       base_snapshot: snapshot_id, repository: config.repository, base_branch, base_sha,
       branch: `fm/${config.task_id}-${run_id}`, harness: config.harness, tmux_session: `fm-${run_id}`,
       remote_repo: REPO_PATH, remote_run_dir: `/vercel/sandbox/firstmate/${run_id}`,
+      remote_inbox_dir: `/vercel/sandbox/firstmate/${run_id}/inbox`,
       spawn_gen: `s${clock()}.${process.pid}.${run_id}`, kind: 'ship', mode: 'direct-PR', yolo: 'off', endpoint_task_id: config.task_id,
       project: config.local_project || '', worktree: '', window: path,
       deadline: clock() + config.timeout_ms, delivery_state: 'allocating', cleanup_state: 'pending' };
@@ -223,7 +225,7 @@ existing=$(git ls-remote --heads origin ${quote(record.branch)})
 test -z "$existing"
 git fetch origin ${quote(base_sha)}
 git checkout -b ${quote(record.branch)} ${quote(base_sha)}
-mkdir -p ${quote(record.remote_run_dir)}
+mkdir -p ${quote(record.remote_inbox_dir + '/handled')}
 rm -f ${quote(record.remote_run_dir + '/done')} ${quote(record.remote_run_dir + '/result.json')}
 `;
       await command(record, 'sh', ['-ceu', setup]);
@@ -232,6 +234,12 @@ Run ID: ${run_id}. Repository: ${record.repository}. Base branch: ${base_branch}
 Implement and test the task, commit, push this branch, and open a direct PR against the recorded base.
 After a successful push and PR creation, run: node ${record.remote_run_dir}/complete.mjs <full-PR-URL>
 Do not merge. Do not run local Firstmate supervision or use local orchestration hooks.
+Durable Firstmate steering inbox: the inbox is ${record.remote_inbox_dir} and persists with this sandbox.
+While working, poll ${record.remote_inbox_dir}/*.msg at every natural checkpoint and before completing the task.
+List messages in numeric filename order, ignoring hidden files and the handled directory.
+Read each message in order; its exact instruction body starts after the line --, and act on it before reading newer messages.
+After successfully acting on a message, acknowledge it by moving the exact file to ${record.remote_inbox_dir}/handled/ with: mv -- <message-file> ${record.remote_inbox_dir}/handled/.
+The move is the acknowledgement. Never delete an unhandled message or acknowledge one before acting on it.
 \nTask:\n${brief}\n`;
       const launch = `#!/bin/sh\nset -eu\ncd ${quote(REPO_PATH)}\nexec ${HARNESSES[record.harness]} "$(cat ${quote(record.remote_run_dir + '/brief.md')})"\n`;
       const current = await session(record);
@@ -280,6 +288,42 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
     // argv transport, literal flag, and separate submit. Never retry ambiguous input.
     await command(record, 'tmux', ['send-keys', '-t', paneTarget(record), '-l', '--', text]);
     return { sent: true };
+  }
+  async function steer(record, text) {
+    requireThat(typeof text === 'string' && Buffer.byteLength(text) <= 8192 && !text.includes('\0'),
+      'steer text must be at most 8192 bytes without NUL');
+    const current = await session(record);
+    const inbox = record.remote_inbox_dir || `${record.remote_run_dir}/inbox`;
+    const expectedRunDir = `/vercel/sandbox/firstmate/${record.run_id}`;
+    requireThat(record.remote_run_dir === expectedRunDir && inbox === `${expectedRunDir}/inbox`,
+      'unsafe remote inbox identity');
+    const stage = `${inbox}/.staging-${uuid()}.msg`;
+    const content = `schema=${INBOX_SCHEMA}\nat=${new Date(clock()).toISOString().replace(/\.\d{3}Z$/, 'Z')}\n--\n${text}`;
+    await current.writeFiles([{ path: stage, content, mode: 0o600 }], { signal: signal() });
+    const result = await current.runCommand({
+      cmd: 'sh',
+      args: ['-ceu', `
+inbox=${quote(inbox)}
+stage=${quote(stage)}
+test -f "$stage"
+mkdir -p "$inbox/handled"
+max=$(find "$inbox" "$inbox/handled" -maxdepth 1 -type f -name '*.msg' -exec basename {} \\; |
+  sed -n 's/^\\([0-9][0-9]*\\)\\.msg$/\\1/p' | sort -n | tail -1)
+max=$(printf '%s' "$max" | sed 's/^0*//')
+max=\${max:-0}
+next=$(printf '%03d' "$((max + 1))")
+target="$inbox/$next.msg"
+test ! -e "$target"
+mv "$stage" "$target"
+printf '%s\\n' "$target"
+`],
+      timeoutMs: REQUEST_MS, signal: signal(),
+    });
+    requireThat(result.exitCode === 0, 'remote inbox write failed');
+    const path = (await result.stdout()).trim();
+    requireThat(path.startsWith(`${inbox}/`) && /^[0-9]+\.msg$/.test(path.slice(inbox.length + 1)),
+      'remote inbox returned an invalid record path');
+    return { path };
   }
   async function submit(record) {
     await command(record, 'tmux', ['send-keys', '-t', paneTarget(record), 'Enter']);
@@ -407,12 +451,12 @@ Do not merge. Do not run local Firstmate supervision or use local orchestration 
       await sleep(Math.min(backoff, Math.max(0, Number(record.deadline) - clock())));
     }
   }
-  return { attach, preflight, spawn, inspect, capture, send, submit, cleanup, watch, result, stopCompleted, reconcile, landed };
+  return { attach, preflight, spawn, inspect, capture, send, steer, submit, cleanup, watch, result, stopCompleted, reconcile, landed };
 }
 
 async function main() {
   const [operation, path, ...args] = process.argv.slice(2);
-  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'submit', 'watch', 'stop', 'delete', 'reconcile', 'landed', 'update', 'attach'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
+  requireThat(path && ['doctor', 'spawn', 'inspect', 'capture', 'send', 'steer', 'submit', 'watch', 'stop', 'delete', 'reconcile', 'landed', 'update', 'attach'].includes(operation), 'use bin/backends/vercel.sh --backend vercel <operation> <record>');
   // update is local-only and entered under the ordinary metadata lock.
   if (operation === 'update') {
     let input = '';
@@ -462,13 +506,13 @@ async function main() {
       requireThat(process.stdin.isTTY && process.stdout.isTTY, 'attach requires an interactive terminal');
       await interactive(await execution.attach(record), record);
     } else if (operation === 'capture') process.stdout.write(await execution.capture(record, args[0] === undefined ? 100 : Number(args[0])));
-    else if (operation === 'send') {
+    else if (operation === 'send' || operation === 'steer') {
       let text = '';
       for await (const chunk of process.stdin) {
         text += chunk.toString('utf8');
         requireThat(Buffer.byteLength(text) <= 8192, 'input too large');
       }
-      json(await execution.send(record, text));
+      json(await execution[operation](record, text));
     } else json(await execution[operation](record));
   }
 }
